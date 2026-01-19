@@ -2,12 +2,12 @@ name: KIBER SOS Autopost
 
 on:
   schedule:
-    - cron: '0 8 * * *'    # 9:00 Amsterdam
-    - cron: '0 11 * * *'   # 12:00 Amsterdam
-    - cron: '0 14 * * *'   # 15:00 Amsterdam
-    - cron: '0 17 * * *'   # 18:00 Amsterdam
-    - cron: '0 20 * * *'   # 21:00 Amsterdam
-  workflow_dispatch:       # Для ручного запуска
+    - cron: '0 6 * * *'    # 9:00 Moscow
+    - cron: '0 9 * * *'    # 12:00 Moscow
+    - cron: '0 12 * * *'   # 15:00 Moscow
+    - cron: '0 15 * * *'   # 18:00 Moscow
+    - cron: '0 18 * * *'   # 21:00 Moscow
+  workflow_dispatch:
 
 jobs:
   autopost:
@@ -33,3 +33,4 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
         run: python scripts/kibersos_autopost.py
+
