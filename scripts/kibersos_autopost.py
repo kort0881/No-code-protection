@@ -38,11 +38,15 @@ HEADERS = {
     )
 }
 
-POSTED_FILE = "posted_articles.json"
-RETENTION_DAYS = 7
-LAST_TYPE_FILE = "last_post_type.json"
-LAST_SECURITY_FILE = "last_security_post.json"
+# Папка для кэша (будет сохраняться между запусками)
+CACHE_DIR = os.getenv("CACHE_DIR", "cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
 
+POSTED_FILE = os.path.join(CACHE_DIR, "posted_articles.json")
+LAST_TYPE_FILE = os.path.join(CACHE_DIR, "last_post_type.json")
+LAST_SECURITY_FILE = os.path.join(CACHE_DIR, "last_security_post.json")
+
+RETENTION_DAYS = 7
 MAX_ARTICLE_AGE_DAYS = 3
 
 # ============ СТИЛЬ KIBER SOS ============
@@ -442,32 +446,87 @@ def short_summary(title: str, summary: str, link: str) -> Optional[str]:
     return None
 
 
-# ============ ГЕНЕРАЦИЯ КАРТИНОК ============
+# ============ ГЕНЕРАЦИЯ КАРТИНОК (ИСПРАВЛЕНО) ============
+
+# Разные стили для разнообразия картинок
+IMAGE_STYLES = [
+    "minimalist flat vector illustration, cybersecurity theme",
+    "modern 3D render, digital protection concept",
+    "isometric design, internet security",
+    "clean infographic style, data privacy",
+    "abstract geometric art, cyber defense",
+    "neon glow aesthetic, digital safety",
+    "low poly art style, online protection",
+    "gradient mesh illustration, secure technology",
+    "line art with accent color, privacy shield",
+    "paper cut style, digital security layers",
+]
+
+# Визуальные элементы для рандомизации
+IMAGE_ELEMENTS = [
+    "shield, lock, protection",
+    "padlock, firewall, barrier",
+    "key, encryption, secure",
+    "eye, surveillance, privacy",
+    "phone, device, mobile security",
+    "laptop, computer, safe browsing",
+    "cloud, data, storage protection",
+    "fingerprint, biometric, identity",
+    "warning sign, alert, danger",
+    "checkmark, verified, safe",
+]
+
+# Цветовые схемы
+COLOR_SCHEMES = [
+    "blue and white tones",
+    "dark blue and cyan accents",
+    "purple and pink gradient",
+    "green and teal palette",
+    "orange and dark gray",
+    "red warning with dark background",
+    "monochrome with blue accent",
+    "navy and gold highlights",
+]
+
 
 def generate_image(title: str, max_retries: int = 3) -> Optional[str]:
-    image_styles = [
-        "minimalist flat illustration, cyber security, lock, shield, ",
-        "clean infographic style, privacy, devices, ",
-        "modern digital art, protection, safe internet, ",
-    ]
-
-    style = random.choice(image_styles)
-
+    """Генерирует уникальное изображение с рандомизацией стиля."""
+    
     for attempt in range(max_retries):
-        seed = random.randint(0, 10**7)
-        clean_title = title[:60].replace('"', "").replace("'", "").replace("\n", " ")
-
+        # Рандомизация всех параметров
+        seed = random.randint(0, 10**9)
+        style = random.choice(IMAGE_STYLES)
+        elements = random.choice(IMAGE_ELEMENTS)
+        colors = random.choice(COLOR_SCHEMES)
+        
+        # Берём ключевые слова из заголовка
+        clean_title = title[:40].replace('"', "").replace("'", "").replace("\n", " ")
+        
+        # Собираем уникальный промпт
         prompt = (
-            f"{style}{clean_title}, "
-            "4k quality, no text, no letters, no words, "
-            "clean composition, professional"
+            f"{style}, {elements}, {colors}, "
+            f"concept: {clean_title}, "
+            "4k quality, no text, no letters, no words, no watermark, "
+            "clean composition, professional, digital art"
         )
+        
+        # Добавляем случайный модификатор для ещё большей уникальности
+        modifiers = [
+            "trending on artstation",
+            "behance featured",
+            "dribbble shot",
+            "award winning design",
+            "editorial illustration",
+        ]
+        prompt += f", {random.choice(modifiers)}"
 
         try:
             encoded = urllib.parse.quote(prompt)
             url = f"https://image.pollinations.ai/prompt/{encoded}?seed={seed}&width=1024&height=1024&nologo=true"
 
             print(f"  🎨 Генерация изображения (попытка {attempt + 1}/{max_retries})...")
+            print(f"     Стиль: {style[:30]}...")
+            print(f"     Seed: {seed}")
 
             resp = requests.get(url, timeout=90, headers=HEADERS)
 
@@ -492,7 +551,7 @@ def generate_image(title: str, max_retries: int = 3) -> Optional[str]:
             print(f"  ❌ Неожиданная ошибка: {e}")
 
         if attempt < max_retries - 1:
-            await_time = (attempt + 1) * 2
+            await_time = (attempt + 1) * 3
             print(f"  ⏳ Ждём {await_time}с...")
             time.sleep(await_time)
 
