@@ -4,7 +4,6 @@ import asyncio
 import random
 import re
 import time
-import subprocess
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
@@ -44,7 +43,6 @@ RETENTION_DAYS = 7
 LAST_TYPE_FILE = "last_post_type.json"
 LAST_SECURITY_FILE = "last_security_post.json"
 
-# свежесть новости (в днях)
 MAX_ARTICLE_AGE_DAYS = 3
 
 # ============ СТИЛЬ KIBER SOS ============
@@ -171,38 +169,6 @@ def save_posted(article_id: str) -> None:
     save_posted_articles()
 
 
-def commit_and_push_posted_articles() -> None:
-    """Коммитит обновленный posted_articles.json в репозиторий"""
-    try:
-        # Конфигурируем git
-        subprocess.run(["git", "config", "user.email", "action@github.com"], check=True)
-        subprocess.run(["git", "config", "user.name", "GitHub Action"], check=True)
-        
-        # Добавляем файл
-        subprocess.run(["git", "add", POSTED_FILE], check=True)
-        
-        # Проверяем, есть ли изменения
-        result = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
-            capture_output=True
-        )
-        
-        if result.returncode != 0:  # Если есть изменения
-            subprocess.run(
-                ["git", "commit", "-m", "📝 Update posted articles"],
-                check=True
-            )
-            subprocess.run(["git", "push"], check=True)
-            print("✅ Сохранено в репозиторий")
-        else:
-            print("ℹ️ Нет изменений для коммита")
-            
-    except subprocess.CalledProcessError as e:
-        print(f"⚠️ Ошибка git: {e}")
-    except Exception as e:
-        print(f"⚠️ Ошибка при сохранении в git: {e}")
-
-
 def load_last_post_type() -> Optional[str]:
     if not os.path.exists(LAST_TYPE_FILE):
         return None
@@ -304,7 +270,7 @@ def build_final_post(core_text: str, link: str, max_total: int = 1024) -> str:
     return final
 
 
-# ============ PARSERS (РУССКИЕ ИСТОЧНИКИ) ============
+# ============ PARSERS ============
 
 def load_rss(url: str, source: str) -> List[Dict]:
     articles = []
@@ -355,17 +321,15 @@ def load_rss(url: str, source: str) -> List[Dict]:
 
 def load_articles_from_sites() -> List[Dict]:
     articles: List[Dict] = []
-
+    
     articles.extend(
         load_rss("https://www.securitylab.ru/rss/allnews/", "SecurityLab")
     )
-
     articles.extend(
         load_rss("https://1275.ru/vulnerability/feed", "1275 Vulnerabilities")
     )
     articles.extend(load_rss("https://1275.ru/news/feed", "1275 News"))
     articles.extend(load_rss("https://1275.ru/security/feed", "1275 Security"))
-
     articles.extend(
         load_rss("https://www.anti-malware.ru/news/feed", "AntiMalware News")
     )
@@ -478,7 +442,7 @@ def short_summary(title: str, summary: str, link: str) -> Optional[str]:
     return None
 
 
-# ============ ГЕНЕРАЦИЯ КАРТИНОК (опционально) ============
+# ============ ГЕНЕРАЦИЯ КАРТИНОК ============
 
 def generate_image(title: str, max_retries: int = 3) -> Optional[str]:
     image_styles = [
@@ -598,9 +562,6 @@ async def autopost():
 
             save_posted(art["id"])
             posted_count += 1
-
-            # 🔥 СОХРАНЯЕМ В GIT ПОСЛЕ КАЖДОГО ПОСТА
-            commit_and_push_posted_articles()
 
             save_last_security_ts()
             last_type = art.get("post_type", "security")
