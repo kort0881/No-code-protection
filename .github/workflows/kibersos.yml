@@ -22,11 +22,27 @@ jobs:
         run: mkdir -p cache
       
       - name: Restore cache
+        id: cache-restore
         uses: actions/cache/restore@v4
         with:
           path: cache/
-          key: kiber-sos-${{ github.run_id }}
-          restore-keys: kiber-sos-
+          key: kiber-sos-cache-v1
+          restore-keys: |
+            kiber-sos-cache-
+            kiber-sos-
+      
+      - name: Debug - Cache status
+        run: |
+          echo "🔍 Cache hit: ${{ steps.cache-restore.outputs.cache-hit }}"
+          echo ""
+          echo "📂 Содержимое cache/:"
+          ls -la cache/ 2>/dev/null || echo "  (пусто)"
+          echo ""
+          echo "📄 source_rotation.json:"
+          cat cache/source_rotation.json 2>/dev/null || echo "  (не существует)"
+          echo ""
+          echo "📄 posted_articles.json:"
+          cat cache/posted_articles.json 2>/dev/null || echo "  (не существует)"
       
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -46,9 +62,32 @@ jobs:
           CACHE_DIR: cache
         run: python scripts/kibersos_autopost.py
       
+      - name: Debug - Show results
+        if: always()
+        run: |
+          echo ""
+          echo "📂 Содержимое cache/ ПОСЛЕ:"
+          ls -la cache/
+          echo ""
+          echo "📄 source_rotation.json:"
+          cat cache/source_rotation.json 2>/dev/null || echo "  (ошибка)"
+          echo ""
+          echo "📄 posted_articles.json:"
+          cat cache/posted_articles.json 2>/dev/null || echo "  (ошибка)"
+      
+      # Удаляем старый кэш перед сохранением нового
+      - name: Delete old cache
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🗑️ Удаление старого кэша..."
+          gh cache delete kiber-sos-cache-v1 || echo "Кэш не найден или уже удалён"
+      
       - name: Save cache
         uses: actions/cache/save@v4
         if: always()
         with:
           path: cache/
-          key: kiber-sos-${{ github.run_id }}
+          key: kiber-sos-cache-v1
