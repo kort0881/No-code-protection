@@ -4,8 +4,9 @@ import asyncio
 import random
 import re
 import time
+import hashlib
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import requests
 import feedparser
@@ -38,183 +39,322 @@ HEADERS = {
     )
 }
 
-# Папка для кэша (будет сохраняться между запусками)
 CACHE_DIR = os.getenv("CACHE_DIR", "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 POSTED_FILE = os.path.join(CACHE_DIR, "posted_articles.json")
-LAST_TYPE_FILE = os.path.join(CACHE_DIR, "last_post_type.json")
-LAST_SECURITY_FILE = os.path.join(CACHE_DIR, "last_security_post.json")
+SOURCE_ROTATION_FILE = os.path.join(CACHE_DIR, "source_rotation.json")
 
-RETENTION_DAYS = 7
+RETENTION_DAYS = 14
 MAX_ARTICLE_AGE_DAYS = 3
 
-# ============ СТИЛЬ KIBER SOS ============
+# ============ RSS ИСТОЧНИКИ С РОТАЦИЕЙ ============
 
-SECURITY_POST_PROMPT = """
-Ты ведёшь Telegram-канал «KIBER SOS» про цифровую безопасность для обычных людей.
-Твоя задача — перевести сухую новость по информационной безопасности на простой язык.
+RSS_SOURCES = [
+    {"name": "1275 Vulnerabilities", "url": "https://1275.ru/vulnerability/feed", "priority": 1},
+    {"name": "1275 News", "url": "https://1275.ru/news/feed", "priority": 2},
+    {"name": "1275 Security", "url": "https://1275.ru/security/feed", "priority": 2},
+    {"name": "AntiMalware News", "url": "https://www.anti-malware.ru/news/feed", "priority": 1},
+    {"name": "SecurityLab", "url": "https://www.securitylab.ru/rss/allnews/", "priority": 1},
+]
 
-Формат поста (строго соблюдай структуру и порядок блоков):
+# ============ РАСШИРЕННЫЙ ПРОМПТ ДЛЯ КРЕАТИВНОСТИ ============
 
-🔴 Опасность:
-1–2 предложения. Простыми словами опиши, что именно может пойти не так (без корп.жаргона).
+POST_STYLES = [
+    {
+        "name": "story",
+        "prompt": """
+Ты ведёшь Telegram-канал «KIBER SOS» про цифровую безопасность.
+Напиши пост в стиле ИСТОРИИ — начни с короткого сценария от первого лица.
 
-⚠️ Почему это реально:
-1 короткий пример из жизни, как обычный человек может попасть в эту ситуацию.
-Никакой фантастики, только реалистичный сценарий.
+Формат:
+📱 История:
+2-3 предложения от лица обычного человека, который чуть не попался (или попался).
 
-🛠 Что сделать прямо сейчас:
-Сделай 2–4 пункта простых действий, которые человек может выполнить САМ за 5–10 минут.
-Это могут быть шаги вида:
-• проверить настройки;
-• отключить/удалить что‑то;
-• включить защитную функцию;
-• поменять пароли;
-• включить 2FA;
-• пересмотреть права приложений.
+🔴 Что произошло:
+1-2 предложения — суть угрозы простым языком.
 
-✅ Итог:
-1 предложение: чего человек избегает, если сделает эти действия (кража денег, захват аккаунта, слив фото, шантаж и т.п.).
+🛡 Как защититься:
+3-4 конкретных действия, которые можно сделать за 5 минут.
 
-Важно:
-• Пост должен легко поместиться в ~600–900 символов.
-• Язык: только русский, максимально простой.
-• Не выдумывай деталей, которых нет в новости, опирайся на общие практики цифровой безопасности.
-• Не упоминай бизнес, корпорации, ISO, SOC и т.п. — только обычные люди, их устройства и аккаунты.
+✅ Вывод:
+1 мотивирующее предложение.
 
-Запрещено:
-• Любые инструкции по атакам, взлому, эксплуатации уязвимостей.
-• Формулировки «как взломать», «как обойти защиту», «эксплойт».
-• Рекламный тон и фразы «идеальное решение», «уникальный продукт», «комплексное решение».
-
-Верни ТОЛЬКО текст поста с этими блоками, без хештегов и ссылок.
+Объём: 700-1000 символов. Язык простой, живой, без корпоративщины.
 """
+    },
+    {
+        "name": "checklist",
+        "prompt": """
+Ты ведёшь Telegram-канал «KIBER SOS» про цифровую безопасность.
+Напиши пост в стиле ЧЕКЛИСТА — максимум практики, минимум воды.
+
+Формат:
+⚡️ [Броский заголовок про угрозу]
+
+Что случилось: 1-2 предложения о проблеме.
+
+✅ Чеклист защиты:
+□ Действие 1 (конкретное)
+□ Действие 2 (конкретное)
+□ Действие 3 (конкретное)
+□ Действие 4 (конкретное)
+□ Действие 5 (если нужно)
+
+⏱ Время: X минут
+🎯 Результат: что получишь, если сделаешь.
+
+Объём: 600-900 символов. Каждый пункт — конкретное действие.
+"""
+    },
+    {
+        "name": "myth_buster",
+        "prompt": """
+Ты ведёшь Telegram-канал «KIBER SOS» про цифровую безопасность.
+Напиши пост в стиле РАЗРУШИТЕЛЬ МИФОВ.
+
+Формат:
+🤔 Миф: [Распространённое заблуждение по теме новости]
+
+❌ Почему это неправда:
+2-3 предложения с объяснением.
+
+✅ Как на самом деле:
+2-3 предложения правды.
+
+🛠 Что делать:
+3-4 практических шага.
+
+Объём: 700-1000 символов. Стиль — дружелюбный эксперт.
+"""
+    },
+    {
+        "name": "warning",
+        "prompt": """
+Ты ведёшь Telegram-канал «KIBER SOS» про цифровую безопасность.
+Напиши пост в стиле СРОЧНОЕ ПРЕДУПРЕЖДЕНИЕ.
+
+Формат:
+🚨 ВНИМАНИЕ: [Суть угрозы в 5-7 словах]
+
+Что происходит:
+2-3 предложения о проблеме — конкретно и страшновато (но без паники).
+
+Кто в зоне риска:
+1-2 предложения — кого это касается.
+
+🛡 Защитись сейчас:
+1. Действие (конкретное)
+2. Действие (конкретное)
+3. Действие (конкретное)
+4. Действие (конкретное)
+
+💪 Сделай это — и угроза тебя не коснётся.
+
+Объём: 700-950 символов. Тон — срочный, но не паникёрский.
+"""
+    },
+    {
+        "name": "explainer",
+        "prompt": """
+Ты ведёшь Telegram-канал «KIBER SOS» про цифровую безопасность.
+Напиши пост в стиле ОБЪЯСНЯЛКА — как будто рассказываешь другу.
+
+Формат:
+🔍 [Вопрос, который мог бы задать читатель]
+
+Короткий ответ: 1 предложение.
+
+Подробнее:
+3-4 предложения простым языком — что, как, почему.
+
+Что с этим делать:
+• Совет 1
+• Совет 2
+• Совет 3
+• Совет 4
+
+📌 Запомни: [Ключевая мысль одним предложением]
+
+Объём: 700-1000 символов. Тон — умный друг, не зануда.
+"""
+    },
+]
 
 # ============ КЛЮЧЕВЫЕ СЛОВА ============
 
 SECURITY_KEYWORDS = [
     "уязвимость", "уязвимости", "vulnerability", "vulnerabilities",
     "утечка", "утечка данных", "data breach", "leak", "breach",
-    "взлом", "взломали", "hack", "was hacked",
+    "взлом", "взломали", "hack", "hacked",
     "фишинг", "phishing", "scam", "мошенничество",
-    "malware", "вредоносное по", "ransomware",
-    "пароль", "password", "password manager", "менеджер паролей",
-    "браузер", "browser extension", "расширение браузера",
-    "android", "ios", "windows", "macos", "telegram", "телеграм"
+    "malware", "вредоносное", "ransomware", "троян",
+    "пароль", "password", "двухфакторная", "2fa",
+    "браузер", "browser", "расширение",
+    "android", "ios", "windows", "macos", "telegram", "whatsapp",
+    "приватность", "privacy", "слежка", "tracking",
+    "vpn", "шифрование", "encryption"
 ]
 
 SENSATIONAL_KEYWORDS = [
-    "взлом", "взломали", "утечка", "утечка данных", "data breach", "leak",
+    "взлом", "взломали", "утечка", "data breach", "leak",
     "ransomware", "шантаж", "выкуп", "шифровальщик",
-    "кибератака", "атака", "ddos", "фишинг", "phishing",
-    "0-day", "нулевого дня"
+    "кибератака", "атака", "ddos", "фишинг",
+    "0-day", "нулевого дня", "критическ", "массов"
 ]
 
 EXCLUDE_KEYWORDS = [
     "акции", "биржа", "котировки", "инвестиции", "ipo",
-    "капитализация", "выручка", "прибыль", "убыток",
-    "курс доллара", "курс евро", "политик", "выборы",
-    "теннис", "футбол", "спорт", "фильм", "сериал",
-    "биткоин", "bitcoin", "криптовалюта",
-    "суд", "арест", "приговор", "штраф"
+    "капитализация", "выручка", "прибыль",
+    "курс доллара", "политик", "выборы",
+    "футбол", "спорт", "фильм", "сериал",
+    "биткоин", "криптовалют",
 ]
 
 BAD_PHRASES = [
-    "предлагает решение",
-    "предлагает уникальное решение",
-    "обеспечивает высококачественную защиту",
-    "обеспечивает надёжную защиту",
-    "обеспечивает надежную защиту",
-    "обеспечивает защиту",
-    "комплексное решение для",
-    "идеальное решение для",
-    "помогает бизнесу эффективнее работать",
+    "предлагает решение", "комплексное решение",
+    "идеальное решение", "уникальное решение",
+    "высококачественную защиту", "надёжную защиту",
 ]
 
 
-def is_too_promotional(text: str) -> bool:
-    low = text.lower()
-    return any(p in low for p in BAD_PHRASES)
+# ============ STATE MANAGEMENT ============
 
-
-# ============ STATE ============
-
-posted_articles: Dict[str, Optional[float]] = {}
-
-if os.path.exists(POSTED_FILE):
-    with open(POSTED_FILE, "r", encoding="utf-8") as f:
+def load_json_file(filepath: str, default: any) -> any:
+    if os.path.exists(filepath):
         try:
-            posted_data = json.load(f)
-            posted_articles = {item["id"]: item.get("timestamp") for item in posted_data}
-        except Exception:
-            posted_articles = {}
+            with open(filepath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"⚠️ Ошибка чтения {filepath}: {e}")
+    return default
 
 
-def save_posted_articles() -> None:
-    data = [{"id": id_str, "timestamp": ts} for id_str, ts in posted_articles.items()]
-    with open(POSTED_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def clean_old_posts() -> None:
-    global posted_articles
-    now = datetime.now().timestamp()
-    cutoff = now - (RETENTION_DAYS * 86400)
-    posted_articles = {
-        id_str: ts for id_str, ts in posted_articles.items()
-        if ts is None or ts > cutoff
-    }
-    save_posted_articles()
-
-
-def save_posted(article_id: str) -> None:
-    posted_articles[article_id] = datetime.now().timestamp()
-    save_posted_articles()
-
-
-def load_last_post_type() -> Optional[str]:
-    if not os.path.exists(LAST_TYPE_FILE):
-        return None
+def save_json_file(filepath: str, data: any) -> None:
     try:
-        with open(LAST_TYPE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data.get("type")
-    except Exception:
-        return None
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ Ошибка записи {filepath}: {e}")
 
 
-def save_last_post_type(post_type: str) -> None:
-    try:
-        with open(LAST_TYPE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"type": post_type}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+def get_article_hash(title: str, link: str) -> str:
+    """Создаём уникальный хэш статьи."""
+    content = f"{title}|{link}"
+    return hashlib.md5(content.encode()).hexdigest()[:16]
 
 
-def load_last_security_ts() -> Optional[float]:
-    if not os.path.exists(LAST_SECURITY_FILE):
-        return None
-    try:
-        with open(LAST_SECURITY_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data.get("ts")
-    except Exception:
-        return None
+class StateManager:
+    def __init__(self):
+        self.posted_articles: Dict[str, float] = {}
+        self.source_rotation: Dict = {
+            "last_source_index": -1,
+            "last_style_index": -1,
+            "source_post_counts": {},
+            "daily_sources_used": [],
+            "last_reset_date": None
+        }
+        self._load_state()
+    
+    def _load_state(self):
+        # Загрузка опубликованных статей
+        posted_data = load_json_file(POSTED_FILE, [])
+        if isinstance(posted_data, list):
+            self.posted_articles = {
+                item.get("id", item.get("hash", "")): item.get("timestamp", 0) 
+                for item in posted_data if item
+            }
+        
+        # Загрузка ротации
+        self.source_rotation = load_json_file(SOURCE_ROTATION_FILE, self.source_rotation)
+        
+        # Сброс дневной статистики если новый день
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self.source_rotation.get("last_reset_date") != today:
+            self.source_rotation["daily_sources_used"] = []
+            self.source_rotation["last_reset_date"] = today
+            print(f"📅 Новый день ({today}), сброс ротации источников")
+    
+    def save_state(self):
+        # Сохранение опубликованных
+        posted_list = [
+            {"id": id_str, "timestamp": ts} 
+            for id_str, ts in self.posted_articles.items()
+        ]
+        save_json_file(POSTED_FILE, posted_list)
+        
+        # Сохранение ротации
+        save_json_file(SOURCE_ROTATION_FILE, self.source_rotation)
+    
+    def is_posted(self, article_id: str) -> bool:
+        return article_id in self.posted_articles
+    
+    def mark_posted(self, article_id: str, source_name: str):
+        self.posted_articles[article_id] = datetime.now().timestamp()
+        
+        # Обновляем счётчики
+        counts = self.source_rotation.get("source_post_counts", {})
+        counts[source_name] = counts.get(source_name, 0) + 1
+        self.source_rotation["source_post_counts"] = counts
+        
+        # Добавляем в использованные сегодня
+        if source_name not in self.source_rotation["daily_sources_used"]:
+            self.source_rotation["daily_sources_used"].append(source_name)
+        
+        self.save_state()
+    
+    def clean_old_posts(self):
+        now = datetime.now().timestamp()
+        cutoff = now - (RETENTION_DAYS * 86400)
+        old_count = len(self.posted_articles)
+        self.posted_articles = {
+            id_str: ts for id_str, ts in self.posted_articles.items()
+            if ts and ts > cutoff
+        }
+        removed = old_count - len(self.posted_articles)
+        if removed > 0:
+            print(f"🧹 Удалено {removed} старых записей из кэша")
+        self.save_state()
+    
+    def get_next_source_priority(self) -> List[str]:
+        """Возвращает источники в порядке приоритета с учётом ротации."""
+        used_today = set(self.source_rotation.get("daily_sources_used", []))
+        counts = self.source_rotation.get("source_post_counts", {})
+        
+        # Сортируем: сначала неиспользованные сегодня, потом по количеству постов
+        sources = []
+        for src in RSS_SOURCES:
+            name = src["name"]
+            sources.append({
+                "name": name,
+                "url": src["url"],
+                "used_today": name in used_today,
+                "total_posts": counts.get(name, 0),
+                "priority": src["priority"]
+            })
+        
+        # Сначала неиспользованные сегодня, потом с меньшим количеством постов
+        sources.sort(key=lambda x: (x["used_today"], x["total_posts"], -x["priority"]))
+        
+        return sources
+    
+    def get_next_style(self) -> Dict:
+        """Возвращает следующий стиль поста с ротацией."""
+        last_idx = self.source_rotation.get("last_style_index", -1)
+        next_idx = (last_idx + 1) % len(POST_STYLES)
+        self.source_rotation["last_style_index"] = next_idx
+        return POST_STYLES[next_idx]
 
 
-def save_last_security_ts() -> None:
-    try:
-        with open(LAST_SECURITY_FILE, "w", encoding="utf-8") as f:
-            json.dump({"ts": datetime.now().timestamp()}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+state = StateManager()
 
 
 # ============ HELPERS ============
 
 def clean_text(text: str) -> str:
-    return " ".join(text.replace("\n", " ").replace("\r", " ").split())
+    text = re.sub(r'<[^>]+>', '', text)  # Убираем HTML теги
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
 
 
 def ensure_complete_sentence(text: str) -> str:
@@ -223,63 +363,54 @@ def ensure_complete_sentence(text: str) -> str:
         return text
     if text[-1] in ".!?":
         return text
-    last_period = text.rfind(".")
-    last_exclaim = text.rfind("!")
-    last_question = text.rfind("?")
-    last_end = max(last_period, last_exclaim, last_question)
-    if last_end > 0:
-        return text[: last_end + 1]
+    
+    for end_char in [". ", "! ", "? "]:
+        last_pos = text.rfind(end_char)
+        if last_pos > len(text) * 0.5:  # Не обрезаем больше половины
+            return text[:last_pos + 1]
+    
     return text + "."
 
 
-def trim_core_text_to_limit(core_text: str, max_core_length: int) -> str:
-    core_text = core_text.strip()
-    if len(core_text) <= max_core_length:
-        return ensure_complete_sentence(core_text)
-    sentence_pattern = r"(?<=[.!?])\s+"
-    sentences = re.split(sentence_pattern, core_text)
-    result = ""
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-        candidate = (result + " " + sentence).strip() if result else sentence
-        if len(candidate) <= max_core_length:
-            result = candidate
-        else:
-            break
-    if not result and sentences:
-        result = sentences[0][:max_core_length]
-        if len(result) == max_core_length and " " in result:
-            result = result.rsplit(" ", 1)[0]
-    return ensure_complete_sentence(result)
-
-
 def get_hashtags() -> str:
-    return "#безопасность #приватность #кибербезопасность"
+    tags_pool = [
+        "#безопасность", "#кибербезопасность", "#приватность",
+        "#защита", "#пароли", "#фишинг", "#взлом", "#данные",
+        "#смартфон", "#интернет", "#советы"
+    ]
+    selected = random.sample(tags_pool, min(3, len(tags_pool)))
+    return " ".join(selected)
 
 
 def build_final_post(core_text: str, link: str, max_total: int = 1024) -> str:
-    cta_line = "\n\nЕсли полезно — сохрани пост и перешли близким."
+    cta_variants = [
+        "\n\n💾 Сохрани и перешли тем, кому это важно.",
+        "\n\n📲 Полезно? Перешли друзьям и родным.",
+        "\n\n🔄 Поделись с близкими — пусть тоже будут в безопасности.",
+        "\n\n👆 Сохрани пост — пригодится.",
+    ]
+    cta_line = random.choice(cta_variants)
     source_line = f'\n\n🔗 <a href="{link}">Источник</a>'
     hashtag_line = f"\n\n{get_hashtags()}"
+    
     service_length = len(cta_line) + len(source_line) + len(hashtag_line)
-    max_core_length = max_total - service_length - 10
-    trimmed_core = trim_core_text_to_limit(core_text, max_core_length)
-    final = trimmed_core + cta_line + hashtag_line + source_line
-    if len(final) > max_total:
-        overflow = len(final) - max_total
-        trimmed_core = trim_core_text_to_limit(core_text, max_core_length - overflow - 20)
-        final = trimmed_core + cta_line + hashtag_line + source_line
-    return final
+    max_core = max_total - service_length - 20
+    
+    if len(core_text) > max_core:
+        core_text = core_text[:max_core]
+        core_text = ensure_complete_sentence(core_text)
+    
+    return core_text + cta_line + hashtag_line + source_line
 
 
-# ============ PARSERS ============
+# ============ RSS LOADING ============
 
 def load_rss(url: str, source: str) -> List[Dict]:
     articles = []
     try:
-        feed = feedparser.parse(url)
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        feed = feedparser.parse(resp.content)
+        
         if feed.bozo and not feed.entries:
             print(f"⚠️ RSS недоступен: {source}")
             return articles
@@ -290,352 +421,310 @@ def load_rss(url: str, source: str) -> List[Dict]:
     now = datetime.now()
     max_age = timedelta(days=MAX_ARTICLE_AGE_DAYS)
 
-    for entry in feed.entries[:50]:
+    for entry in feed.entries[:30]:
         link = entry.get("link", "")
-        if not link or link in posted_articles:
+        title = clean_text(entry.get("title", ""))
+        
+        if not link or not title:
+            continue
+        
+        article_id = get_article_hash(title, link)
+        
+        if state.is_posted(article_id):
             continue
 
         pub_dt = now
         if hasattr(entry, "published_parsed") and entry.published_parsed:
-            pub_dt = datetime(*entry.published_parsed[:6])
-        elif hasattr(entry, "updated_parsed") and entry.updated_parsed:
-            pub_dt = datetime(*entry.updated_parsed[:6])
+            try:
+                pub_dt = datetime(*entry.published_parsed[:6])
+            except:
+                pass
 
         if now - pub_dt > max_age:
             continue
 
-        articles.append(
-            {
-                "id": link,
-                "title": clean_text(entry.get("title") or ""),
-                "summary": clean_text(
-                    entry.get("summary") or entry.get("description") or ""
-                )[:700],
-                "link": link,
-                "source": source,
-                "published_parsed": pub_dt,
-            }
-        )
-
-    if articles:
-        print(f"✅ {source}: {len(articles)} свежих статей")
+        summary = clean_text(entry.get("summary", "") or entry.get("description", ""))
+        
+        articles.append({
+            "id": article_id,
+            "title": title,
+            "summary": summary[:1000],
+            "link": link,
+            "source": source,
+            "published": pub_dt,
+        })
 
     return articles
 
 
-def load_articles_from_sites() -> List[Dict]:
-    articles: List[Dict] = []
+def load_all_articles() -> Dict[str, List[Dict]]:
+    """Загружает статьи, группируя по источникам."""
+    articles_by_source: Dict[str, List[Dict]] = {}
     
-    articles.extend(
-        load_rss("https://www.securitylab.ru/rss/allnews/", "SecurityLab")
-    )
-    articles.extend(
-        load_rss("https://1275.ru/vulnerability/feed", "1275 Vulnerabilities")
-    )
-    articles.extend(load_rss("https://1275.ru/news/feed", "1275 News"))
-    articles.extend(load_rss("https://1275.ru/security/feed", "1275 Security"))
-    articles.extend(
-        load_rss("https://www.anti-malware.ru/news/feed", "AntiMalware News")
-    )
-
-    return articles
-
-
-def filter_articles(articles: List[Dict]) -> List[Dict]:
-    sensational = []
-    general = []
-
-    for e in articles:
-        text = f"{e['title']} {e['summary']}".lower()
-
-        if any(kw in text for kw in EXCLUDE_KEYWORDS):
-            continue
-
-        is_sensational = any(kw in text for kw in SENSATIONAL_KEYWORDS)
-        has_security = any(kw in text for kw in SECURITY_KEYWORDS)
-
-        if not has_security and not is_sensational:
-            continue
-
-        if is_sensational:
-            e["post_type"] = "sensational"
-            sensational.append(e)
+    for src in RSS_SOURCES:
+        name = src["name"]
+        url = src["url"]
+        articles = load_rss(url, name)
+        
+        if articles:
+            print(f"✅ {name}: {len(articles)} свежих статей")
+            articles_by_source[name] = articles
         else:
-            e["post_type"] = "security"
-            general.append(e)
+            print(f"⚪ {name}: нет новых статей")
+    
+    return articles_by_source
 
-    sensational.sort(key=lambda x: x["published_parsed"], reverse=True)
-    general.sort(key=lambda x: x["published_parsed"], reverse=True)
 
-    return sensational + general
+def filter_article(article: Dict) -> Optional[str]:
+    """Проверяет статью и возвращает тип (sensational/security) или None."""
+    text = f"{article['title']} {article['summary']}".lower()
+    
+    if any(kw in text for kw in EXCLUDE_KEYWORDS):
+        return None
+    
+    is_sensational = any(kw in text for kw in SENSATIONAL_KEYWORDS)
+    has_security = any(kw in text for kw in SECURITY_KEYWORDS)
+    
+    if is_sensational:
+        return "sensational"
+    elif has_security:
+        return "security"
+    
+    return None
+
+
+def select_best_article(articles_by_source: Dict[str, List[Dict]]) -> Optional[Dict]:
+    """Выбирает лучшую статью с учётом ротации источников."""
+    
+    source_priority = state.get_next_source_priority()
+    print(f"\n📊 Приоритет источников: {[s['name'] for s in source_priority]}")
+    
+    for src_info in source_priority:
+        source_name = src_info["name"]
+        
+        if source_name not in articles_by_source:
+            continue
+        
+        articles = articles_by_source[source_name]
+        
+        # Сортируем: сначала sensational, потом по дате
+        scored_articles = []
+        for art in articles:
+            art_type = filter_article(art)
+            if art_type:
+                score = 2 if art_type == "sensational" else 1
+                scored_articles.append((score, art["published"], art, art_type))
+        
+        if not scored_articles:
+            continue
+        
+        # Сортировка: по score (desc), потом по дате (desc)
+        scored_articles.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        
+        # Берём одну из топ-3 случайно (для разнообразия)
+        top_n = min(3, len(scored_articles))
+        selected = random.choice(scored_articles[:top_n])
+        
+        article = selected[2]
+        article["post_type"] = selected[3]
+        
+        print(f"✅ Выбрана статья из {source_name}: {article['title'][:50]}...")
+        return article
+    
+    return None
 
 
 # ============ ГЕНЕРАЦИЯ ТЕКСТА ============
 
-def build_security_prompt(title: str, summary: str) -> str:
-    news_text = f"Заголовок: {title}\n\nТекст: {summary}"
-    return SECURITY_POST_PROMPT + "\n\nНОВОСТЬ:\n" + news_text
-
-
-def validate_generated_text(text: str) -> tuple[bool, str]:
-    text = text.strip()
-    if not text:
-        return False, "Пустой текст"
-    if len(text) < 200:
-        return False, f"Слишком короткий текст ({len(text)} символов)"
-    if text.count("(") != text.count(")"):
-        return False, "Незакрытые скобки"
-    if text.count("«") != text.count("»"):
-        return False, "Незакрытые кавычки"
-    return True, "OK"
-
-
-def short_summary(title: str, summary: str, link: str) -> Optional[str]:
-    prompt = build_security_prompt(title, summary)
-    max_attempts = 2
-
-    for attempt in range(max_attempts):
-        try:
-            res = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Ты — автор Telegram-канала «KIBER SOS» про цифровую безопасность "
-                            "для обычных людей. Строго соблюдаешь заданный шаблон блоков "
-                            "и не даёшь инструкции по атакам, только по защите."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.4,
-                max_tokens=650,
-            )
-            core = res.choices[0].message.content.strip()
-
-            if core.startswith('"') and core.endswith('"'):
-                core = core[1:-1]
-            if core.startswith("«") and core.endswith("»"):
-                core = core[1:-1]
-
-            core = core.strip()
-
-            is_valid, reason = validate_generated_text(core)
-            if not is_valid:
-                print(f"  ⚠️ Попытка {attempt + 1}: {reason}")
-                if attempt < max_attempts - 1:
-                    continue
-                core = ensure_complete_sentence(core)
-
-            if is_too_promotional(core):
-                print("  ⚠️ Текст слишком рекламный, пропускаем")
-                return None
-
-            final = build_final_post(core, link, max_total=1024)
-            print(f"  ✅ Сгенерирован пост: {len(final)} символов")
-            return final
-
-        except Exception as e:
-            print(f"❌ OpenAI ошибка: {e}")
-            if attempt < max_attempts - 1:
-                time.sleep(2)
-                continue
-            return None
-
-    return None
-
-
-# ============ ГЕНЕРАЦИЯ КАРТИНОК (ИСПРАВЛЕНО) ============
-
-# Разные стили для разнообразия картинок
-IMAGE_STYLES = [
-    "minimalist flat vector illustration, cybersecurity theme",
-    "modern 3D render, digital protection concept",
-    "isometric design, internet security",
-    "clean infographic style, data privacy",
-    "abstract geometric art, cyber defense",
-    "neon glow aesthetic, digital safety",
-    "low poly art style, online protection",
-    "gradient mesh illustration, secure technology",
-    "line art with accent color, privacy shield",
-    "paper cut style, digital security layers",
-]
-
-# Визуальные элементы для рандомизации
-IMAGE_ELEMENTS = [
-    "shield, lock, protection",
-    "padlock, firewall, barrier",
-    "key, encryption, secure",
-    "eye, surveillance, privacy",
-    "phone, device, mobile security",
-    "laptop, computer, safe browsing",
-    "cloud, data, storage protection",
-    "fingerprint, biometric, identity",
-    "warning sign, alert, danger",
-    "checkmark, verified, safe",
-]
-
-# Цветовые схемы
-COLOR_SCHEMES = [
-    "blue and white tones",
-    "dark blue and cyan accents",
-    "purple and pink gradient",
-    "green and teal palette",
-    "orange and dark gray",
-    "red warning with dark background",
-    "monochrome with blue accent",
-    "navy and gold highlights",
-]
-
-
-def generate_image(title: str, max_retries: int = 3) -> Optional[str]:
-    """Генерирует уникальное изображение с рандомизацией стиля."""
+def generate_post_text(article: Dict) -> Optional[str]:
+    """Генерирует креативный пост с ротацией стилей."""
     
-    for attempt in range(max_retries):
-        # Рандомизация всех параметров
-        seed = random.randint(0, 10**9)
-        style = random.choice(IMAGE_STYLES)
-        elements = random.choice(IMAGE_ELEMENTS)
-        colors = random.choice(COLOR_SCHEMES)
-        
-        # Берём ключевые слова из заголовка
-        clean_title = title[:40].replace('"', "").replace("'", "").replace("\n", " ")
-        
-        # Собираем уникальный промпт
-        prompt = (
-            f"{style}, {elements}, {colors}, "
-            f"concept: {clean_title}, "
-            "4k quality, no text, no letters, no words, no watermark, "
-            "clean composition, professional, digital art"
+    style = state.get_next_style()
+    print(f"  🎨 Стиль поста: {style['name']}")
+    
+    news_context = f"""
+НОВОСТЬ:
+Заголовок: {article['title']}
+
+Содержание: {article['summary']}
+
+Источник: {article['source']}
+"""
+    
+    full_prompt = style["prompt"] + "\n\n" + news_context + """
+
+ВАЖНО:
+- Не выдумывай факты, которых нет в новости
+- Пиши только про защиту, никаких инструкций по взлому
+- Язык простой, для обычных людей
+- Без рекламы и корпоративного жаргона
+"""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты — автор популярного Telegram-канала о цифровой безопасности. "
+                        "Пишешь живо, понятно, с заботой о читателе. "
+                        "Никакой воды, только польза."
+                    ),
+                },
+                {"role": "user", "content": full_prompt},
+            ],
+            temperature=0.7,  # Повышаем для креативности
+            max_tokens=800,
         )
         
-        # Добавляем случайный модификатор для ещё большей уникальности
-        modifiers = [
-            "trending on artstation",
-            "behance featured",
-            "dribbble shot",
-            "award winning design",
-            "editorial illustration",
-        ]
-        prompt += f", {random.choice(modifiers)}"
+        text = response.choices[0].message.content.strip()
+        
+        # Очистка
+        if text.startswith('"') and text.endswith('"'):
+            text = text[1:-1]
+        if text.startswith("«") and text.endswith("»"):
+            text = text[1:-1]
+        
+        # Проверки
+        if len(text) < 200:
+            print(f"  ⚠️ Слишком короткий текст: {len(text)} символов")
+            return None
+        
+        if any(phrase in text.lower() for phrase in BAD_PHRASES):
+            print("  ⚠️ Обнаружен рекламный текст")
+            return None
+        
+        final = build_final_post(text, article["link"])
+        print(f"  ✅ Сгенерирован пост: {len(final)} символов")
+        return final
+        
+    except Exception as e:
+        print(f"  ❌ Ошибка OpenAI: {e}")
+        return None
 
+
+# ============ ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ============
+
+IMAGE_THEMES = [
+    ("minimalist flat vector, cybersecurity", "blue and white"),
+    ("3D isometric illustration, digital security", "purple gradient"),
+    ("neon glow style, cyber protection", "dark with cyan"),
+    ("modern geometric art, data privacy", "teal and orange"),
+    ("clean infographic style, online safety", "green accents"),
+    ("abstract digital art, secure technology", "blue and gold"),
+    ("low poly 3D render, internet protection", "gradient mesh"),
+    ("line art illustration, mobile security", "monochrome with red"),
+]
+
+
+def generate_image(title: str) -> Optional[str]:
+    """Генерирует уникальное изображение."""
+    
+    theme = random.choice(IMAGE_THEMES)
+    seed = random.randint(1, 999999999)
+    
+    # Извлекаем ключевые слова из заголовка
+    keywords = title[:50].replace('"', '').replace("'", "")
+    
+    prompt = (
+        f"{theme[0]}, {theme[1]} color scheme, "
+        f"concept about: {keywords}, "
+        "professional quality, no text, no letters, no watermark, "
+        "clean composition, 4k"
+    )
+    
+    encoded_prompt = urllib.parse.quote(prompt)
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?seed={seed}&width=1024&height=1024&nologo=true"
+    
+    print(f"  🎨 Генерация изображения (seed: {seed})...")
+    
+    for attempt in range(3):
         try:
-            encoded = urllib.parse.quote(prompt)
-            url = f"https://image.pollinations.ai/prompt/{encoded}?seed={seed}&width=1024&height=1024&nologo=true"
-
-            print(f"  🎨 Генерация изображения (попытка {attempt + 1}/{max_retries})...")
-            print(f"     Стиль: {style[:30]}...")
-            print(f"     Seed: {seed}")
-
             resp = requests.get(url, timeout=90, headers=HEADERS)
-
-            if resp.status_code == 200:
-                content_type = resp.headers.get("content-type", "")
-                if "image" in content_type and len(resp.content) > 10000:
-                    fname = f"img_{seed}.jpg"
-                    with open(fname, "wb") as f:
-                        f.write(resp.content)
-                    print(f"  ✅ Изображение сохранено: {fname}")
-                    return fname
-                else:
-                    print(f"  ⚠️ Неверный контент (size: {len(resp.content)})")
-            else:
-                print(f"  ⚠️ HTTP {resp.status_code}")
-
-        except requests.Timeout:
-            print("  ⚠️ Таймаут при генерации изображения")
-        except requests.RequestException as e:
-            print(f"  ⚠️ Ошибка сети: {e}")
+            
+            if resp.status_code == 200 and len(resp.content) > 10000:
+                filename = f"img_{seed}.jpg"
+                with open(filename, "wb") as f:
+                    f.write(resp.content)
+                print(f"  ✅ Изображение сохранено: {filename}")
+                return filename
+            
         except Exception as e:
-            print(f"  ❌ Неожиданная ошибка: {e}")
-
-        if attempt < max_retries - 1:
-            await_time = (attempt + 1) * 3
-            print(f"  ⏳ Ждём {await_time}с...")
-            time.sleep(await_time)
-
-    print("  ❌ Не удалось сгенерировать изображение")
+            print(f"  ⚠️ Попытка {attempt + 1}: {e}")
+            time.sleep(3)
+    
+    print("  ❌ Не удалось создать изображение")
     return None
 
 
-def cleanup_image(filepath: Optional[str]) -> None:
+def cleanup_image(filepath: Optional[str]):
     if filepath and os.path.exists(filepath):
         try:
             os.remove(filepath)
-        except Exception as e:
-            print(f"  ⚠️ Не удалось удалить {filepath}: {e}")
+        except:
+            pass
 
 
-# ============ АВТОПОСТ ============
+# ============ MAIN ============
 
 async def autopost():
-    clean_old_posts()
-    print("🔄 Загрузка статей...")
-    articles = load_articles_from_sites()
-    candidates = filter_articles(articles)
-
-    if not candidates:
-        print("❌ Нет подходящих свежих новостей.")
+    print("🚀 KIBER SOS Autopost запущен")
+    print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    state.clean_old_posts()
+    
+    print("\n🔄 Загрузка статей...")
+    articles_by_source = load_all_articles()
+    
+    total_articles = sum(len(arts) for arts in articles_by_source.values())
+    print(f"\n📊 Всего найдено: {total_articles} статей")
+    
+    if total_articles == 0:
+        print("❌ Нет подходящих статей")
         return
-
-    print(f"📊 Найдено кандидатов: {len(candidates)}")
-
-    posted_count = 0
-    max_posts = 1
-
-    sensational_candidates = [c for c in candidates if c.get("post_type") == "sensational"]
-    other_candidates = [c for c in candidates if c.get("post_type") != "sensational"]
-
-    def pick_next_article() -> Optional[Dict]:
-        if sensational_candidates:
-            return sensational_candidates.pop(0)
-        if other_candidates:
-            return other_candidates.pop(0)
-        return None
-
-    while posted_count < max_posts:
-        art = pick_next_article()
-        if not art:
-            break
-
-        print(f"\n🔍 Обработка: {art['title'][:80]}... [{art['source']}]")
-
-        post_text = short_summary(art["title"], art["summary"], art["link"])
-
-        if not post_text:
-            print("  ⚠️ Не удалось сгенерировать текст, пробуем следующую")
-            continue
-
-        img = generate_image(art["title"])
-
-        try:
-            if img:
-                await bot.send_photo(
-                    CHANNEL_ID,
-                    photo=FSInputFile(img),
-                    caption=post_text,
-                )
-            else:
-                await bot.send_message(CHANNEL_ID, text=post_text)
-
-            save_posted(art["id"])
-            posted_count += 1
-
-            save_last_security_ts()
-            last_type = art.get("post_type", "security")
-            save_last_post_type(last_type)
-            print(f"✅ Опубликовано: {art['source']} (type={last_type})")
-
-        except Exception as e:
-            print(f"❌ Ошибка отправки в Telegram: {e}")
-        finally:
-            cleanup_image(img)
-
-    if posted_count == 0:
-        print("⚠️ Не удалось опубликовать ни одного поста")
-    else:
-        print(f"\n🎉 Успешно опубликовано постов: {posted_count}")
+    
+    # Выбираем лучшую статью с ротацией
+    article = select_best_article(articles_by_source)
+    
+    if not article:
+        print("❌ Не найдено подходящих статей после фильтрации")
+        return
+    
+    print(f"\n🔍 Обработка: {article['title'][:70]}...")
+    print(f"   Источник: {article['source']}")
+    print(f"   Тип: {article.get('post_type', 'unknown')}")
+    
+    # Генерируем текст
+    post_text = generate_post_text(article)
+    
+    if not post_text:
+        print("❌ Не удалось сгенерировать текст")
+        return
+    
+    # Генерируем картинку
+    image_path = generate_image(article["title"])
+    
+    # Публикуем
+    try:
+        if image_path:
+            await bot.send_photo(
+                CHANNEL_ID,
+                photo=FSInputFile(image_path),
+                caption=post_text,
+            )
+        else:
+            await bot.send_message(CHANNEL_ID, text=post_text)
+        
+        state.mark_posted(article["id"], article["source"])
+        print(f"\n✅ Опубликовано успешно!")
+        print(f"   Источник: {article['source']}")
+        print(f"   ID: {article['id']}")
+        
+    except Exception as e:
+        print(f"❌ Ошибка публикации: {e}")
+    finally:
+        cleanup_image(image_path)
 
 
 async def main():
