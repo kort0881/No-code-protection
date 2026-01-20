@@ -2,11 +2,10 @@ name: KIBER SOS Autopost
 
 on:
   schedule:
-    - cron: '0 6 * * *'
-    - cron: '0 9 * * *'
-    - cron: '0 12 * * *'
-    - cron: '0 15 * * *'
-    - cron: '0 18 * * *'
+    - cron: '0 6 * * *'    # 9:00 МСК
+    - cron: '0 9 * * *'    # 12:00 МСК
+    - cron: '0 12 * * *'   # 15:00 МСК
+    - cron: '0 18 * * *'   # 21:00 МСК
   workflow_dispatch:
 
 jobs:
@@ -40,9 +39,6 @@ jobs:
           echo ""
           echo "📄 source_rotation.json:"
           cat cache/source_rotation.json 2>/dev/null || echo "  (не существует)"
-          echo ""
-          echo "📄 posted_articles.json:"
-          cat cache/posted_articles.json 2>/dev/null || echo "  (не существует)"
       
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -66,24 +62,16 @@ jobs:
         if: always()
         run: |
           echo ""
-          echo "📂 Содержимое cache/ ПОСЛЕ:"
-          ls -la cache/
-          echo ""
           echo "📄 source_rotation.json:"
           cat cache/source_rotation.json 2>/dev/null || echo "  (ошибка)"
-          echo ""
-          echo "📄 posted_articles.json:"
-          cat cache/posted_articles.json 2>/dev/null || echo "  (ошибка)"
       
-      # Удаляем старый кэш перед сохранением нового
       - name: Delete old cache
         if: always()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "🗑️ Удаление старого кэша..."
-          gh cache delete kiber-sos-cache-v1 || echo "Кэш не найден или уже удалён"
+          gh cache delete kiber-sos-cache-v1 || true
       
       - name: Save cache
         uses: actions/cache/save@v4
