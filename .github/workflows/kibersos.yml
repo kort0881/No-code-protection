@@ -9,6 +9,9 @@ on:
     - cron: '0 18 * * *'   # 21:00 Moscow
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   autopost:
     runs-on: ubuntu-latest
@@ -16,6 +19,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -33,4 +38,11 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
         run: python scripts/kibersos_autopost.py
-
+      
+      - name: Commit posted articles
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "📝 Update posted articles"
+          file_pattern: "*.json"
+          commit_user_name: "GitHub Action"
+          commit_user_email: "action@github.com"
