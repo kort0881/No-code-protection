@@ -1,0 +1,4 @@
+aiogram==3.4.1
+openai==1.12.0
+feedparser==6.0.11
+requests==2.31.0
