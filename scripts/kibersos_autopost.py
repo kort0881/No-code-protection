@@ -4,6 +4,7 @@ import asyncio
 import random
 import re
 import time
+import subprocess
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
@@ -129,11 +130,11 @@ BAD_PHRASES = [
     "помогает бизнесу эффективнее работать",
 ]
 
+
 def is_too_promotional(text: str) -> bool:
     low = text.lower()
-    if any(p in low for p in BAD_PHRASES):
-        return True
-    return False
+    return any(p in low for p in BAD_PHRASES)
+
 
 # ============ STATE ============
 
@@ -147,10 +148,12 @@ if os.path.exists(POSTED_FILE):
         except Exception:
             posted_articles = {}
 
+
 def save_posted_articles() -> None:
     data = [{"id": id_str, "timestamp": ts} for id_str, ts in posted_articles.items()]
     with open(POSTED_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
 
 def clean_old_posts() -> None:
     global posted_articles
@@ -162,9 +165,43 @@ def clean_old_posts() -> None:
     }
     save_posted_articles()
 
+
 def save_posted(article_id: str) -> None:
     posted_articles[article_id] = datetime.now().timestamp()
     save_posted_articles()
+
+
+def commit_and_push_posted_articles() -> None:
+    """Коммитит обновленный posted_articles.json в репозиторий"""
+    try:
+        # Конфигурируем git
+        subprocess.run(["git", "config", "user.email", "action@github.com"], check=True)
+        subprocess.run(["git", "config", "user.name", "GitHub Action"], check=True)
+        
+        # Добавляем файл
+        subprocess.run(["git", "add", POSTED_FILE], check=True)
+        
+        # Проверяем, есть ли изменения
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            capture_output=True
+        )
+        
+        if result.returncode != 0:  # Если есть изменения
+            subprocess.run(
+                ["git", "commit", "-m", "📝 Update posted articles"],
+                check=True
+            )
+            subprocess.run(["git", "push"], check=True)
+            print("✅ Сохранено в репозиторий")
+        else:
+            print("ℹ️ Нет изменений для коммита")
+            
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️ Ошибка git: {e}")
+    except Exception as e:
+        print(f"⚠️ Ошибка при сохранении в git: {e}")
+
 
 def load_last_post_type() -> Optional[str]:
     if not os.path.exists(LAST_TYPE_FILE):
@@ -176,12 +213,14 @@ def load_last_post_type() -> Optional[str]:
     except Exception:
         return None
 
+
 def save_last_post_type(post_type: str) -> None:
     try:
         with open(LAST_TYPE_FILE, "w", encoding="utf-8") as f:
             json.dump({"type": post_type}, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
 
 def load_last_security_ts() -> Optional[float]:
     if not os.path.exists(LAST_SECURITY_FILE):
@@ -193,6 +232,7 @@ def load_last_security_ts() -> Optional[float]:
     except Exception:
         return None
 
+
 def save_last_security_ts() -> None:
     try:
         with open(LAST_SECURITY_FILE, "w", encoding="utf-8") as f:
@@ -200,10 +240,12 @@ def save_last_security_ts() -> None:
     except Exception:
         pass
 
+
 # ============ HELPERS ============
 
 def clean_text(text: str) -> str:
     return " ".join(text.replace("\n", " ").replace("\r", " ").split())
+
 
 def ensure_complete_sentence(text: str) -> str:
     text = text.strip()
@@ -218,6 +260,7 @@ def ensure_complete_sentence(text: str) -> str:
     if last_end > 0:
         return text[: last_end + 1]
     return text + "."
+
 
 def trim_core_text_to_limit(core_text: str, max_core_length: int) -> str:
     core_text = core_text.strip()
@@ -241,8 +284,10 @@ def trim_core_text_to_limit(core_text: str, max_core_length: int) -> str:
             result = result.rsplit(" ", 1)[0]
     return ensure_complete_sentence(result)
 
+
 def get_hashtags() -> str:
     return "#безопасность #приватность #кибербезопасность"
+
 
 def build_final_post(core_text: str, link: str, max_total: int = 1024) -> str:
     cta_line = "\n\nЕсли полезно — сохрани пост и перешли близким."
@@ -257,6 +302,7 @@ def build_final_post(core_text: str, link: str, max_total: int = 1024) -> str:
         trimmed_core = trim_core_text_to_limit(core_text, max_core_length - overflow - 20)
         final = trimmed_core + cta_line + hashtag_line + source_line
     return final
+
 
 # ============ PARSERS (РУССКИЕ ИСТОЧНИКИ) ============
 
@@ -306,27 +352,26 @@ def load_rss(url: str, source: str) -> List[Dict]:
 
     return articles
 
+
 def load_articles_from_sites() -> List[Dict]:
     articles: List[Dict] = []
 
-    # SecurityLab — новости ИБ (разные ленты можно взять с /rss.php) [web:106]
     articles.extend(
         load_rss("https://www.securitylab.ru/rss/allnews/", "SecurityLab")
     )
 
-    # 1275.ru — уязвимости, новости, безопасность [web:109]
     articles.extend(
         load_rss("https://1275.ru/vulnerability/feed", "1275 Vulnerabilities")
     )
     articles.extend(load_rss("https://1275.ru/news/feed", "1275 News"))
     articles.extend(load_rss("https://1275.ru/security/feed", "1275 Security"))
 
-    # Anti-Malware.ru — новости [web:135]
     articles.extend(
         load_rss("https://www.anti-malware.ru/news/feed", "AntiMalware News")
     )
 
     return articles
+
 
 def filter_articles(articles: List[Dict]) -> List[Dict]:
     sensational = []
@@ -356,11 +401,13 @@ def filter_articles(articles: List[Dict]) -> List[Dict]:
 
     return sensational + general
 
+
 # ============ ГЕНЕРАЦИЯ ТЕКСТА ============
 
 def build_security_prompt(title: str, summary: str) -> str:
     news_text = f"Заголовок: {title}\n\nТекст: {summary}"
     return SECURITY_POST_PROMPT + "\n\nНОВОСТЬ:\n" + news_text
+
 
 def validate_generated_text(text: str) -> tuple[bool, str]:
     text = text.strip()
@@ -373,6 +420,7 @@ def validate_generated_text(text: str) -> tuple[bool, str]:
     if text.count("«") != text.count("»"):
         return False, "Незакрытые кавычки"
     return True, "OK"
+
 
 def short_summary(title: str, summary: str, link: str) -> Optional[str]:
     prompt = build_security_prompt(title, summary)
@@ -428,6 +476,7 @@ def short_summary(title: str, summary: str, link: str) -> Optional[str]:
             return None
 
     return None
+
 
 # ============ ГЕНЕРАЦИЯ КАРТИНОК (опционально) ============
 
@@ -486,12 +535,14 @@ def generate_image(title: str, max_retries: int = 3) -> Optional[str]:
     print("  ❌ Не удалось сгенерировать изображение")
     return None
 
+
 def cleanup_image(filepath: Optional[str]) -> None:
     if filepath and os.path.exists(filepath):
         try:
             os.remove(filepath)
         except Exception as e:
             print(f"  ⚠️ Не удалось удалить {filepath}: {e}")
+
 
 # ============ АВТОПОСТ ============
 
@@ -507,11 +558,6 @@ async def autopost():
 
     print(f"📊 Найдено кандидатов: {len(candidates)}")
 
-    last_type = load_last_post_type()
-    last_security_ts = load_last_security_ts()
-    now_ts = datetime.now().timestamp()
-    security_allowed = last_security_ts is None or (now_ts - last_security_ts) >= 2 * 86400
-
     posted_count = 0
     max_posts = 1
 
@@ -519,7 +565,6 @@ async def autopost():
     other_candidates = [c for c in candidates if c.get("post_type") != "sensational"]
 
     def pick_next_article() -> Optional[Dict]:
-        nonlocal last_type
         if sensational_candidates:
             return sensational_candidates.pop(0)
         if other_candidates:
@@ -554,6 +599,9 @@ async def autopost():
             save_posted(art["id"])
             posted_count += 1
 
+            # 🔥 СОХРАНЯЕМ В GIT ПОСЛЕ КАЖДОГО ПОСТА
+            commit_and_push_posted_articles()
+
             save_last_security_ts()
             last_type = art.get("post_type", "security")
             save_last_post_type(last_type)
@@ -569,11 +617,13 @@ async def autopost():
     else:
         print(f"\n🎉 Успешно опубликовано постов: {posted_count}")
 
+
 async def main():
     try:
         await autopost()
     finally:
         await bot.session.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
