@@ -17,14 +17,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       
-      # Восстанавливаем кэш с posted_articles.json
-      - name: Restore cache
+      - name: Restore and save cache
         uses: actions/cache@v4
         with:
           path: cache
-          key: kiber-sos-cache-${{ github.run_id }}
-          restore-keys: |
-            kiber-sos-cache-
+          key: kiber-sos-cache-${{ runner.os }}
+          restore-keys: kiber-sos-cache-
       
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -43,11 +41,4 @@ jobs:
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           CACHE_DIR: cache
         run: python scripts/kibersos_autopost.py
-      
-      # Сохраняем кэш (автоматически после job)
-      - name: Save cache
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: cache
-          key: kiber-sos-cache-${{ github.run_id }}
+
