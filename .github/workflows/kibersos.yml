@@ -20,25 +20,28 @@ jobs:
       - name: Prepare cache directory
         run: mkdir -p cache
       
+      # Восстанавливаем последний доступный кэш
       - name: Restore cache
         id: cache-restore
         uses: actions/cache/restore@v4
         with:
           path: cache/
-          key: kiber-sos-cache-v1
+          key: kiber-sos-${{ github.run_id }}
           restore-keys: |
-            kiber-sos-cache-
             kiber-sos-
       
-      - name: Debug - Cache status
+      - name: Debug - Cache BEFORE
         run: |
           echo "🔍 Cache hit: ${{ steps.cache-restore.outputs.cache-hit }}"
-          echo ""
-          echo "📂 Содержимое cache/:"
+          echo "📂 Файлы в cache/:"
           ls -la cache/ 2>/dev/null || echo "  (пусто)"
           echo ""
-          echo "📄 source_rotation.json:"
-          cat cache/source_rotation.json 2>/dev/null || echo "  (не существует)"
+          if [ -f cache/state.json ]; then
+            echo "📄 state.json:"
+            cat cache/state.json
+          else
+            echo "⚠️ state.json не найден"
+          fi
       
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -58,24 +61,43 @@ jobs:
           CACHE_DIR: cache
         run: python scripts/kibersos_autopost.py
       
-      - name: Debug - Show results
+      - name: Debug - Cache AFTER
         if: always()
         run: |
+          echo "📂 Файлы в cache/:"
+          ls -la cache/ 2>/dev/null || echo "  (пусто)"
           echo ""
-          echo "📄 source_rotation.json:"
-          cat cache/source_rotation.json 2>/dev/null || echo "  (ошибка)"
+          if [ -f cache/state.json ]; then
+            echo "📄 state.json:"
+            cat cache/state.json
+          else
+            echo "⚠️ state.json не найден"
+          fi
       
-      - name: Delete old cache
-        if: always()
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh cache delete kiber-sos-cache-v1 || true
-      
+      # Сохраняем с уникальным ключом (run_id всегда уникален)
       - name: Save cache
         uses: actions/cache/save@v4
         if: always()
         with:
           path: cache/
-          key: kiber-sos-cache-v1
+          key: kiber-sos-${{ github.run_id }}
+      
+      # Чистим старые кэши (оставляем только последние 5)
+      - name: Cleanup old caches
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🧹 Очистка старых кэшей..."
+          
+          # Получаем список кэшей, сортируем по дате, удаляем старые
+          gh cache list --json id,key,createdAt \
+            --jq '.[] | select(.key | startswith("kiber-sos-")) | .key' \
+            | tail -n +6 \
+            | while read key; do
+                echo "Удаляю: $key"
+                gh cache delete "$key" || true
+              done
+          
+          echo "✅ Готово"
