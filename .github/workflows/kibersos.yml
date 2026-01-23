@@ -14,7 +14,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       
-      # === КЭШИРОВАНИЕ (ВАШ ЛЮБИМЫЙ СПОСОБ) ===
+      # === КЭШИРОВАНИЕ ===
       - name: Prepare cache directory
         run: mkdir -p cache
       
@@ -27,15 +27,7 @@ jobs:
           restore-keys: |
             kiber-sos-
       
-      # === УСТАНОВКА COPILOT CLI ===
-      - name: Set up Node.js (for Copilot)
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      
-      - name: Install Copilot CLI
-        continue-on-error: true
-        run: npm install -g @github/copilot-cli
+      # Убрали проблемный блок с Node.js и npm install @github/copilot-cli
 
       # === PYTHON ===
       - name: Set up Python
@@ -44,9 +36,10 @@ jobs:
           python-version: '3.11'
       
       - name: Install dependencies
+        continue-on-error: true # Чтобы не падал, если SDK нет в pip
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt || echo "⚠️ Не удалось установить все зависимости"
       
       # === ЗАПУСК ===
       - name: Run KIBER SOS autopost
@@ -56,11 +49,11 @@ jobs:
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           CACHE_DIR: cache
           
-          # Включаем Copilot SDK
+          # Пытаемся использовать SDK (код сам решит, можно ли)
           USE_COPILOT_SDK: "true"
           
-          # Токен: сначала ваш личный, если нет - стандартный
-          GH_TOKEN: ${{ secrets.GH_COPILOT_TOKEN || secrets.GITHUB_TOKEN }}
+          # Токен для SDK (если он заработает)
+          GH_TOKEN: ${{ secrets.GH_COPILOT_TOKEN }}
         run: python scripts/kibersos_autopost.py
       
       # === СОХРАНЕНИЕ КЭША ===
