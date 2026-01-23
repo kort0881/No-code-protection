@@ -2,8 +2,12 @@ name: KIBER SOS Autopost
 
 on:
   schedule:
+    # Запуск в 06:00, 09:00, 12:00, 18:00 (UTC)
     - cron: '0 6,9,12,18 * * *'
   workflow_dispatch:
+
+permissions:
+  contents: write # Разрешаем боту сохранять файл истории
 
 jobs:
   autopost:
@@ -13,68 +17,36 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
-      # === КЭШИРОВАНИЕ ===
-      - name: Prepare cache directory
-        run: mkdir -p cache
-      
-      - name: Restore cache
-        id: cache-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: cache/
-          key: kiber-sos-${{ github.run_id }}
-          restore-keys: |
-            kiber-sos-
-      
-      # Убрали проблемный блок с Node.js и npm install @github/copilot-cli
 
-      # === PYTHON ===
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       
       - name: Install dependencies
-        continue-on-error: true # Чтобы не падал, если SDK нет в pip
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || echo "⚠️ Не удалось установить все зависимости"
+          pip install -r requirements.txt
       
-      # === ЗАПУСК ===
+      # Запуск бота (без Copilot)
       - name: Run KIBER SOS autopost
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
-          CACHE_DIR: cache
-          
-          # Пытаемся использовать SDK (код сам решит, можно ли)
-          USE_COPILOT_SDK: "true"
-          
-          # Токен для SDK (если он заработает)
-          GH_TOKEN: ${{ secrets.GH_COPILOT_TOKEN }}
+          # Кэш будет лежать в папке cache_sec внутри репозитория
+          CACHE_DIR: cache_sec
         run: python scripts/kibersos_autopost.py
       
-      # === СОХРАНЕНИЕ КЭША ===
-      - name: Save cache
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: cache/
-          key: kiber-sos-${{ github.run_id }}
-      
-      - name: Cleanup old caches
-        if: always()
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # === СОХРАНЕНИЕ ИСТОРИИ (GIT COMMIT) ===
+      # Это надежнее, чем actions/cache. Файл сохраняется навсегда.
+      - name: Commit state
         run: |
-          gh cache list --json id,key,createdAt \
-            --jq '.[] | select(.key | startswith("kiber-sos-")) | .key' \
-            | tail -n +6 \
-            | while read key; do
-                gh cache delete "$key" || true
-              done
+          git config --local user.email "action@github.com"
+          git config --local user.name "KiberSOS Bot"
+          # Добавляем папку с кэшем
+          git add cache_sec/
+          # Если есть изменения — сохраняем
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update history [skip ci]" && git push)
 
 
