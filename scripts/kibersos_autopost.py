@@ -45,7 +45,8 @@ STATE_FILE = os.path.join(CACHE_DIR, "state_kiber.json")
 
 RETENTION_DAYS = 14
 MAX_ARTICLE_AGE_DAYS = 2
-TELEGRAM_CAPTION_LIMIT = 1024
+TELEGRAM_CAPTION_LIMIT = 1024 # Лимит для фото
+TELEGRAM_TEXT_LIMIT = 4096    # Лимит для простого сообщения
 
 # ============ ИСТОЧНИКИ ============
 
@@ -57,20 +58,20 @@ RSS_SOURCES = [
     {"name": "CNews Security", "url": "https://www.cnews.ru/inc/rss/news_security.xml", "category": "security"},
 ]
 
-# ============ СТИЛЬ ПОСТА (ДЛЯ ОБЫЧНЫХ ЛЮДЕЙ) ============
+# ============ СТИЛЬ ПОСТА (ДЛЯ ЛЮДЕЙ) ============
 
 POST_FORMAT = {
-    "system": """Ты — эксперт по цифровой безопасности, который пишет для обычных людей (не технарей).
+    "system": """Ты — эксперт по цифровой безопасности, который пишет для обычных людей.
 Твоя ЦЕЛЬ: Простым языком объяснить сложную угрозу и подсказать, как защититься.
 
-АУДИТОРИЯ: Обычные пользователи интернета.
-Они не знают, что такое CVE, RCE или эксплойт. Им важно знать: "У меня украдут деньги?", "Мои переписки сольют?".
+АУДИТОРИЯ: Обычные пользователи.
+Им важно: "Украдут ли мои деньги?", "Взломают ли соцсети?".
 
 СТИЛЬ:
 - Тон: Заботливый, предупреждающий, понятный.
-- Избегай сложных терминов или обязательно объясняй их (например: "уязвимость — это дыра в защите").
-- Используй эмодзи для акцентов (⚠️, 🛑, 🛡).
-- Структура: Что случилось -> Чем опасно -> Как защититься.
+- Объясняй термины.
+- Используй эмодзи (⚠️, 🛑, 🛡).
+- Пиши подробно, мысль должна быть законченной.
 - Язык: Русский.
 """,
     "template": """Напиши пост по этой структуре:
@@ -78,14 +79,14 @@ POST_FORMAT = {
 ⚠️ [Заголовок: Суть угрозы понятными словами]
 
 🛑 ЧТО СЛУЧИЛОСЬ:
-[Опиши ситуацию просто. Кто атакует? Кого взломали? Если это программа — какая?]
+[Опиши ситуацию просто. Кто атакует? Кого взломали?]
 
 🤔 ЧЕМ ЭТО ОПАСНО:
-[Объясни последствия для простого человека. Кража паролей? Потеря денег? Слежка?]
+[Последствия: Кража паролей? Потеря денег? Слежка?]
 
 🛡 КАК ЗАЩИТИТЬСЯ:
-• [Простой совет 1: Обновите приложение / Смените пароль]
-• [Простой совет 2: Не нажимайте на ссылки]
+• [Совет 1]
+• [Совет 2]
 
 #Кибербез #Безопасность #KiberSOS
 """
@@ -160,16 +161,6 @@ def clean_text(text: str) -> str:
     text = html.unescape(text)
     return " ".join(text.split())
 
-def force_complete_sentence(text: str) -> str:
-    if not text: return ""
-    text = text.strip()
-    if text[-1] in ".!?": return text
-    
-    cut_pos = max(text.rfind('.'), text.rfind('!'), text.rfind('?'))
-    if cut_pos > len(text) * 0.7:
-        return text[:cut_pos+1]
-    return text + "..."
-
 def fetch_full_article(url: str) -> Optional[str]:
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -182,13 +173,7 @@ def fetch_full_article(url: str) -> Optional[str]:
 
 def build_final_post(text: str, link: str) -> str:
     text = html.escape(text)
-    text = force_complete_sentence(text)
-    
     source = f'\n\n🔗 <a href="{link}">Читать источник</a>'
-    
-    if len(text) + len(source) > TELEGRAM_CAPTION_LIMIT:
-        text = text[:TELEGRAM_CAPTION_LIMIT - len(source) - 50] + "..."
-        
     return text + source
 
 # ============ RSS LOAD ============
@@ -241,7 +226,8 @@ async def generate_post(article: Dict) -> Optional[str]:
                 {"role": "system", "content": POST_FORMAT["system"]},
                 {"role": "user", "content": msg}
             ],
-            temperature=0.5 # Средняя креативность для естественного языка
+            temperature=0.6,
+            max_tokens=1500 # Даем свободу писать длиннее, если нужно
         )
         text = resp.choices[0].message.content.strip()
         text = text.replace("**", "").replace('"', '')
@@ -254,7 +240,6 @@ async def generate_post(article: Dict) -> Optional[str]:
 
 def generate_image(title: str) -> Optional[str]:
     clean_title = re.sub(r'[^a-zA-Z0-9]', ' ', title)[:40]
-    # Промпт для картинки: кибербез, но более "защитный", а не хакерский
     prompt = f"cybersecurity digital protection shield lock safety concept art, blue and white colors, high quality 8k render, {clean_title}"
     
     encoded = urllib.parse.quote(prompt)
@@ -298,22 +283,36 @@ async def autopost():
         post_text = await generate_post(article)
         if not post_text: continue
         
-        img = generate_image(article["title"])
+        # === ГЛАВНАЯ ЛОГИКА ВЫБОРА (ФОТО или ТЕКСТ) ===
         
-        try:
-            if img:
-                await bot.send_photo(CHANNEL_ID, photo=FSInputFile(img), caption=post_text)
-            else:
+        # Если текст короткий (влезает под картинку) -> Генерируем фото
+        if len(post_text) <= TELEGRAM_CAPTION_LIMIT:
+            print("   📸 Текст короткий, генерирую картинку...")
+            img = generate_image(article["title"])
+            
+            try:
+                if img:
+                    await bot.send_photo(CHANNEL_ID, photo=FSInputFile(img), caption=post_text)
+                    cleanup_image(img)
+                else:
+                    await bot.send_message(CHANNEL_ID, text=post_text, disable_web_page_preview=False)
+            except Exception as e:
+                print(f"❌ Ошибка отправки фото: {e}")
+                # Если с фото не вышло, пробуем просто текст
+                await bot.send_message(CHANNEL_ID, text=post_text)
+
+        # Если текст длинный -> Отправляем только текст (без картинки)
+        else:
+            print("   📜 Текст длинный, отправляю БЕЗ картинки (чтобы не резать)...")
+            try:
                 await bot.send_message(CHANNEL_ID, text=post_text, disable_web_page_preview=False)
-            
-            state.mark_posted(article["title"], article["link"])
-            print("✅ Опубликовано!")
-            cleanup_image(img)
-            return # 1 пост за запуск
-            
-        except Exception as e:
-            print(f"❌ Ошибка отправки: {e}")
-            cleanup_image(img)
+            except Exception as e:
+                print(f"❌ Ошибка отправки текста: {e}")
+        
+        # Если успешно отправили
+        state.mark_posted(article["title"], article["link"])
+        print("✅ Опубликовано!")
+        return # 1 пост за запуск
 
 async def main():
     try: await autopost()
