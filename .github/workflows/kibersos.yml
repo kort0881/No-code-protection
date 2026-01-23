@@ -48,10 +48,40 @@ jobs:
         with:
           python-version: '3.11'
       
-      - name: Install dependencies
+      # Установка Node.js для GitHub Copilot CLI
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      # Установка GitHub Copilot CLI
+      - name: Install GitHub Copilot CLI
+        run: |
+          echo "📦 Установка GitHub Copilot CLI..."
+          npm install -g @github/copilot
+          echo "✅ Copilot CLI установлен"
+      
+      # Аутентификация GitHub CLI (для Copilot SDK)
+      - name: Setup GitHub CLI authentication
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🔐 Настройка GitHub CLI..."
+          echo "$GH_TOKEN" | gh auth login --with-token
+          gh auth status
+          echo "✅ GitHub CLI аутентифицирован"
+      
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          echo "✅ Python зависимости установлены"
+      
+      - name: Verify Copilot SDK installation
+        run: |
+          echo "🔍 Проверка установки Copilot SDK..."
+          python -c "import github_copilot_sdk; print('✅ SDK версия:', github_copilot_sdk.__version__)" || echo "⚠️ SDK не установлен"
       
       - name: Run KIBER SOS autopost
         env:
@@ -59,6 +89,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           CACHE_DIR: cache
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python scripts/kibersos_autopost.py
       
       - name: Debug - Cache AFTER
@@ -74,7 +105,7 @@ jobs:
             echo "⚠️ state.json не найден"
           fi
       
-      # Сохраняем с уникальным ключом (run_id всегда уникален)
+      # Сохраняем с уникальным ключом
       - name: Save cache
         uses: actions/cache/save@v4
         if: always()
@@ -82,7 +113,7 @@ jobs:
           path: cache/
           key: kiber-sos-${{ github.run_id }}
       
-      # Чистим старые кэши (оставляем только последние 5)
+      # Чистим старые кэши
       - name: Cleanup old caches
         if: always()
         continue-on-error: true
@@ -90,8 +121,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "🧹 Очистка старых кэшей..."
-          
-          # Получаем список кэшей, сортируем по дате, удаляем старые
           gh cache list --json id,key,createdAt \
             --jq '.[] | select(.key | startswith("kiber-sos-")) | .key' \
             | tail -n +6 \
@@ -99,5 +128,5 @@ jobs:
                 echo "Удаляю: $key"
                 gh cache delete "$key" || true
               done
-          
           echo "✅ Готово"
+
