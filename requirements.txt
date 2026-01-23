@@ -1,9 +1,5 @@
-aiogram==3.4.1
-openai>=1.40.0,<2.0.0
-feedparser==6.0.11
-requests==2.31.0
-httpx>=0.25.0,<1.0.0
-beautifulsoup4>=4.12.0
-github-copilot-sdk>=0.1.0
-lxml
-
+requests
+feedparser
+aiogram
+openai
+beautifulsoup4
