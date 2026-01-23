@@ -48,22 +48,23 @@ jobs:
         with:
           python-version: '3.11'
       
-      # Установка Node.js для GitHub Copilot CLI
+      # Установка Node.js для GitHub Copilot CLI (БЕЗ кэширования npm)
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
       
-      # Установка GitHub Copilot CLI
+      # Установка GitHub Copilot CLI (опционально, для будущего использования SDK)
       - name: Install GitHub Copilot CLI
+        continue-on-error: true
         run: |
           echo "📦 Установка GitHub Copilot CLI..."
           npm install -g @github/copilot
           echo "✅ Copilot CLI установлен"
       
-      # Аутентификация GitHub CLI (для Copilot SDK)
+      # Аутентификация GitHub CLI (опционально, для Copilot SDK)
       - name: Setup GitHub CLI authentication
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -78,10 +79,12 @@ jobs:
           pip install -r requirements.txt
           echo "✅ Python зависимости установлены"
       
-      - name: Verify Copilot SDK installation
+      - name: Verify installations
         run: |
-          echo "🔍 Проверка установки Copilot SDK..."
-          python -c "import github_copilot_sdk; print('✅ SDK версия:', github_copilot_sdk.__version__)" || echo "⚠️ SDK не установлен"
+          echo "🔍 Проверка установок..."
+          python --version
+          pip list | grep -E "aiogram|openai|feedparser"
+          echo "✅ Проверка завершена"
       
       - name: Run KIBER SOS autopost
         env:
@@ -90,6 +93,7 @@ jobs:
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           CACHE_DIR: cache
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          USE_COPILOT_SDK: false
         run: python scripts/kibersos_autopost.py
       
       - name: Debug - Cache AFTER
