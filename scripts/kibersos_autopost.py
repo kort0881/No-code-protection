@@ -38,7 +38,7 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# Папка для кэша (совпадает с той, что в YAML)
+# Папка для кэша
 CACHE_DIR = os.getenv("CACHE_DIR", "cache_sec")
 os.makedirs(CACHE_DIR, exist_ok=True)
 STATE_FILE = os.path.join(CACHE_DIR, "state_kiber.json")
@@ -47,7 +47,7 @@ RETENTION_DAYS = 14
 MAX_ARTICLE_AGE_DAYS = 2
 TELEGRAM_CAPTION_LIMIT = 1024
 
-# ============ ИСТОЧНИКИ (KIBER SOS) ============
+# ============ ИСТОЧНИКИ (SECURITY) ============
 
 RSS_SOURCES = [
     {"name": "SecurityLab", "url": "https://www.securitylab.ru/rss/allnews/", "category": "security"},
@@ -58,37 +58,35 @@ RSS_SOURCES = [
     {"name": "CNews Security", "url": "https://www.cnews.ru/inc/rss/news_security.xml", "category": "security"},
 ]
 
-# ============ ПРОМПТЫ ============
+# ============ СТРУКТУРА ПОСТА (СТРОГАЯ) ============
 
 POST_FORMAT = {
     "system": """Ты — ведущий аналитик Threat Intelligence.
 Твоя ЦЕЛЬ: Дать сухую, технически точную выжимку инцидента.
 
 АУДИТОРИЯ: Сисадмины, DevOps, безопасники.
-Им нужна суть: ЧТО сломали, КАК сломали и КАК починить.
+Они знают базу. Им не нужны "вводные слова". Им нужна суть: ЧТО сломали, КАК сломали и КАК починить.
 
 СТИЛЬ:
 - Тон: Сдержанный, экспертный.
 - Терминология: CVE, RCE, 0-day, эксплойт, фишинг.
-- Структура: Четкие разделы.
-- Без паники ("Шок", "Кошмар" - запрещено).
+- Структура: Строго по шаблону.
+- Без эмоций ("Шок", "Кошмар" - запрещено).
 - Язык: Русский.
 """,
-    "template": """Напиши пост.
+    "template": """Напиши пост строго по этой структуре:
 
-🔥 [Заголовок: Суть]
+🛡 [Заголовок: Суть инцидента]
 
-🛡 ИНЦИДЕНТ:
-[Техническое описание]
+ИНЦИДЕНТ:
+[Техническое описание: В чем суть уязвимости/атаки? Какой компонент затронут?]
 
-💻 ВЕКТОР:
-[Как атакуют?]
+ВЕКТОР АТАКИ:
+[Как злоумышленник проникает? Фишинг, открытый порт, supply chain?]
 
-🛠 MITIGATION:
-• [Что делать / Патч]
-
-⚖️ РИСК:
-[Критично / Высокий]
+MITIGATION (ЧТО ДЕЛАТЬ):
+• [Конкретно: Патч до версии X.X]
+• [Конкретно: Настройка конфига]
 
 #InfoSec #CyberSecurity #KiberSOS
 """
@@ -187,48 +185,15 @@ def build_final_post(text: str, link: str) -> str:
     text = html.escape(text)
     text = force_complete_sentence(text)
     
-    # Красивая ссылка ИСТОЧНИК
-    source = f'\n\n🔗 <a href="{link}">Источник</a>'
+    # Ссылка как в примере
+    source = f'\n\n🔗 <a href="{link}">Читать источник</a>'
     
     if len(text) + len(source) > TELEGRAM_CAPTION_LIMIT:
         text = text[:TELEGRAM_CAPTION_LIMIT - len(source) - 50] + "..."
         
     return text + source
 
-# ============ LOGIC ============
-
-def load_rss(source: Dict) -> List[Dict]:
-    articles = []
-    try:
-        resp = requests.get(source["url"], headers=HEADERS, timeout=20)
-        feed = feedparser.parse(resp.content)
-    except: return []
-    
-    now = datetime.now()
-    for entry in feed.entries[:20]:
-        title = clean_text(entry.get("title", ""))
-        link = entry.get("link", "")
-        if not title or not link: continue
-        
-        if state.is_posted(title, link): continue
-        
-        pub_date = now
-        if hasattr(entry, "published_parsed") and entry.published_parsed:
-            try: pub_date = datetime(*entry.published_parsed[:6])
-            except: pass
-            
-        if now - pub_date > timedelta(days=MAX_ARTICLE_AGE_DAYS): continue
-        
-        summary = clean_text(entry.get("summary", "") or entry.get("description", ""))
-        
-        if any(k in (title+summary).lower() for k in EXCLUDE_KEYWORDS): continue
-        if not is_security_related(title, summary): continue
-        
-        articles.append({
-            "title": title, "summary": summary[:1500], "link": link,
-            "source": source["name"], "date": pub_date
-        })
-    return articles
+# ============ GENERATION ============
 
 async def generate_post(article: Dict) -> Optional[str]:
     full_text = fetch_full_article(article["link"])
@@ -243,7 +208,7 @@ async def generate_post(article: Dict) -> Optional[str]:
                 {"role": "system", "content": POST_FORMAT["system"]},
                 {"role": "user", "content": msg}
             ],
-            temperature=0.3
+            temperature=0.3 # Низкая температура для строгости
         )
         text = resp.choices[0].message.content.strip()
         text = text.replace("**", "").replace('"', '')
@@ -252,9 +217,12 @@ async def generate_post(article: Dict) -> Optional[str]:
         print(f"❌ OpenAI Error: {e}")
         return None
 
+# ============ IMAGE ============
+
 def generate_image(title: str) -> Optional[str]:
+    # Генерируем картинку в стиле "Матрица/Кибербез"
     clean_title = re.sub(r'[^a-zA-Z0-9]', ' ', title)[:40]
-    prompt = f"cybersecurity concept art, digital shield, binary code, matrix, dark blue and red glitch aesthetic, {clean_title}, 8k unreal engine render"
+    prompt = f"cybersecurity digital shield lock binary code matrix style dark blue background {clean_title} 8k render"
     
     encoded = urllib.parse.quote(prompt)
     url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&seed={random.randint(0,99999)}"
@@ -320,6 +288,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
 
 
