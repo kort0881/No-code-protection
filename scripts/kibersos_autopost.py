@@ -47,48 +47,47 @@ RETENTION_DAYS = 14
 MAX_ARTICLE_AGE_DAYS = 2
 TELEGRAM_CAPTION_LIMIT = 1024
 
-# ============ ИСТОЧНИКИ (SECURITY) ============
+# ============ ИСТОЧНИКИ ============
 
 RSS_SOURCES = [
     {"name": "SecurityLab", "url": "https://www.securitylab.ru/rss/allnews/", "category": "security"},
     {"name": "AntiMalware", "url": "https://www.anti-malware.ru/news/feed", "category": "security"},
     {"name": "Habr InfoSec", "url": "https://habr.com/ru/rss/hub/infosecurity/all/?fl=ru", "category": "security"},
     {"name": "Xakep.ru", "url": "https://xakep.ru/feed/", "category": "security"},
-    {"name": "OpenNET", "url": "https://www.opennet.ru/opennews/opennews_all_utf.rss", "category": "linux_sec"},
     {"name": "CNews Security", "url": "https://www.cnews.ru/inc/rss/news_security.xml", "category": "security"},
 ]
 
-# ============ СТРУКТУРА ПОСТА (СТРОГАЯ) ============
+# ============ СТИЛЬ ПОСТА (ДЛЯ ОБЫЧНЫХ ЛЮДЕЙ) ============
 
 POST_FORMAT = {
-    "system": """Ты — ведущий аналитик Threat Intelligence.
-Твоя ЦЕЛЬ: Дать сухую, технически точную выжимку инцидента.
+    "system": """Ты — эксперт по цифровой безопасности, который пишет для обычных людей (не технарей).
+Твоя ЦЕЛЬ: Простым языком объяснить сложную угрозу и подсказать, как защититься.
 
-АУДИТОРИЯ: Сисадмины, DevOps, безопасники.
-Они знают базу. Им не нужны "вводные слова". Им нужна суть: ЧТО сломали, КАК сломали и КАК починить.
+АУДИТОРИЯ: Обычные пользователи интернета.
+Они не знают, что такое CVE, RCE или эксплойт. Им важно знать: "У меня украдут деньги?", "Мои переписки сольют?".
 
 СТИЛЬ:
-- Тон: Сдержанный, экспертный.
-- Терминология: CVE, RCE, 0-day, эксплойт, фишинг.
-- Структура: Строго по шаблону.
-- Без эмоций ("Шок", "Кошмар" - запрещено).
+- Тон: Заботливый, предупреждающий, понятный.
+- Избегай сложных терминов или обязательно объясняй их (например: "уязвимость — это дыра в защите").
+- Используй эмодзи для акцентов (⚠️, 🛑, 🛡).
+- Структура: Что случилось -> Чем опасно -> Как защититься.
 - Язык: Русский.
 """,
-    "template": """Напиши пост строго по этой структуре:
+    "template": """Напиши пост по этой структуре:
 
-🛡 [Заголовок: Суть инцидента]
+⚠️ [Заголовок: Суть угрозы понятными словами]
 
-ИНЦИДЕНТ:
-[Техническое описание: В чем суть уязвимости/атаки? Какой компонент затронут?]
+🛑 ЧТО СЛУЧИЛОСЬ:
+[Опиши ситуацию просто. Кто атакует? Кого взломали? Если это программа — какая?]
 
-ВЕКТОР АТАКИ:
-[Как злоумышленник проникает? Фишинг, открытый порт, supply chain?]
+🤔 ЧЕМ ЭТО ОПАСНО:
+[Объясни последствия для простого человека. Кража паролей? Потеря денег? Слежка?]
 
-MITIGATION (ЧТО ДЕЛАТЬ):
-• [Конкретно: Патч до версии X.X]
-• [Конкретно: Настройка конфига]
+🛡 КАК ЗАЩИТИТЬСЯ:
+• [Простой совет 1: Обновите приложение / Смените пароль]
+• [Простой совет 2: Не нажимайте на ссылки]
 
-#InfoSec #CyberSecurity #KiberSOS
+#Кибербез #Безопасность #KiberSOS
 """
 }
 
@@ -104,7 +103,7 @@ def is_security_related(title: str, summary: str) -> bool:
     kw = ["уязвим", "атак", "взлом", "patch", "update", "шифровал", "spyware", 
           "backdoor", "rce", "cve", "фишинг", "ddos", "leak", "утечка", "троян", 
           "0-day", "exploit", "ботнет", "linux", "root", "permission", "security",
-          "malware", "ransomware", "apt", "soc", "siem", "хакер"]
+          "malware", "ransomware", "apt", "soc", "siem", "хакер", "мошенни"]
     text = f"{title} {summary}".lower()
     return any(k in text for k in kw)
 
@@ -185,13 +184,47 @@ def build_final_post(text: str, link: str) -> str:
     text = html.escape(text)
     text = force_complete_sentence(text)
     
-    # Ссылка как в примере
     source = f'\n\n🔗 <a href="{link}">Читать источник</a>'
     
     if len(text) + len(source) > TELEGRAM_CAPTION_LIMIT:
         text = text[:TELEGRAM_CAPTION_LIMIT - len(source) - 50] + "..."
         
     return text + source
+
+# ============ RSS LOAD ============
+
+def load_rss(source: Dict) -> List[Dict]:
+    articles = []
+    try:
+        resp = requests.get(source["url"], headers=HEADERS, timeout=20)
+        feed = feedparser.parse(resp.content)
+    except: return []
+    
+    now = datetime.now()
+    for entry in feed.entries[:20]:
+        title = clean_text(entry.get("title", ""))
+        link = entry.get("link", "")
+        if not title or not link: continue
+        
+        if state.is_posted(title, link): continue
+        
+        pub_date = now
+        if hasattr(entry, "published_parsed") and entry.published_parsed:
+            try: pub_date = datetime(*entry.published_parsed[:6])
+            except: pass
+            
+        if now - pub_date > timedelta(days=MAX_ARTICLE_AGE_DAYS): continue
+        
+        summary = clean_text(entry.get("summary", "") or entry.get("description", ""))
+        
+        if any(k in (title+summary).lower() for k in EXCLUDE_KEYWORDS): continue
+        if not is_security_related(title, summary): continue
+        
+        articles.append({
+            "title": title, "summary": summary[:1500], "link": link,
+            "source": source["name"], "date": pub_date
+        })
+    return articles
 
 # ============ GENERATION ============
 
@@ -208,7 +241,7 @@ async def generate_post(article: Dict) -> Optional[str]:
                 {"role": "system", "content": POST_FORMAT["system"]},
                 {"role": "user", "content": msg}
             ],
-            temperature=0.3 # Низкая температура для строгости
+            temperature=0.5 # Средняя креативность для естественного языка
         )
         text = resp.choices[0].message.content.strip()
         text = text.replace("**", "").replace('"', '')
@@ -220,9 +253,9 @@ async def generate_post(article: Dict) -> Optional[str]:
 # ============ IMAGE ============
 
 def generate_image(title: str) -> Optional[str]:
-    # Генерируем картинку в стиле "Матрица/Кибербез"
     clean_title = re.sub(r'[^a-zA-Z0-9]', ' ', title)[:40]
-    prompt = f"cybersecurity digital shield lock binary code matrix style dark blue background {clean_title} 8k render"
+    # Промпт для картинки: кибербез, но более "защитный", а не хакерский
+    prompt = f"cybersecurity digital protection shield lock safety concept art, blue and white colors, high quality 8k render, {clean_title}"
     
     encoded = urllib.parse.quote(prompt)
     url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&seed={random.randint(0,99999)}"
@@ -288,5 +321,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
