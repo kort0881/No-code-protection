@@ -2,10 +2,7 @@ name: KIBER SOS Autopost
 
 on:
   schedule:
-    - cron: '0 6 * * *'    # 9:00 МСК
-    - cron: '0 9 * * *'    # 12:00 МСК
-    - cron: '0 12 * * *'   # 15:00 МСК
-    - cron: '0 18 * * *'   # 21:00 МСК
+    - cron: '0 6,9,12,18 * * *'
   workflow_dispatch:
 
 jobs:
@@ -17,10 +14,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       
+      # === КЭШИРОВАНИЕ (ВАШ ЛЮБИМЫЙ СПОСОБ) ===
       - name: Prepare cache directory
         run: mkdir -p cache
       
-      # Восстанавливаем последний доступный кэш
       - name: Restore cache
         id: cache-restore
         uses: actions/cache/restore@v4
@@ -30,86 +27,43 @@ jobs:
           restore-keys: |
             kiber-sos-
       
-      - name: Debug - Cache BEFORE
-        run: |
-          echo "🔍 Cache hit: ${{ steps.cache-restore.outputs.cache-hit }}"
-          echo "📂 Файлы в cache/:"
-          ls -la cache/ 2>/dev/null || echo "  (пусто)"
-          echo ""
-          if [ -f cache/state.json ]; then
-            echo "📄 state.json:"
-            cat cache/state.json
-          else
-            echo "⚠️ state.json не найден"
-          fi
+      # === УСТАНОВКА COPILOT CLI ===
+      - name: Set up Node.js (for Copilot)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
       
+      - name: Install Copilot CLI
+        continue-on-error: true
+        run: npm install -g @github/copilot-cli
+
+      # === PYTHON ===
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       
-      # Установка Node.js для GitHub Copilot CLI (БЕЗ кэширования npm)
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      
-      # Установка GitHub Copilot CLI (опционально, для будущего использования SDK)
-      - name: Install GitHub Copilot CLI
-        continue-on-error: true
-        run: |
-          echo "📦 Установка GitHub Copilot CLI..."
-          npm install -g @github/copilot
-          echo "✅ Copilot CLI установлен"
-      
-      # Аутентификация GitHub CLI (опционально, для Copilot SDK)
-      - name: Setup GitHub CLI authentication
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "🔐 Настройка GitHub CLI..."
-          echo "$GH_TOKEN" | gh auth login --with-token
-          gh auth status
-          echo "✅ GitHub CLI аутентифицирован"
-      
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          echo "✅ Python зависимости установлены"
       
-      - name: Verify installations
-        run: |
-          echo "🔍 Проверка установок..."
-          python --version
-          pip list | grep -E "aiogram|openai|feedparser"
-          echo "✅ Проверка завершена"
-      
+      # === ЗАПУСК ===
       - name: Run KIBER SOS autopost
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           CACHE_DIR: cache
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          USE_COPILOT_SDK: false
+          
+          # Включаем Copilot SDK
+          USE_COPILOT_SDK: "true"
+          
+          # Токен: сначала ваш личный, если нет - стандартный
+          GH_TOKEN: ${{ secrets.GH_COPILOT_TOKEN || secrets.GITHUB_TOKEN }}
         run: python scripts/kibersos_autopost.py
       
-      - name: Debug - Cache AFTER
-        if: always()
-        run: |
-          echo "📂 Файлы в cache/:"
-          ls -la cache/ 2>/dev/null || echo "  (пусто)"
-          echo ""
-          if [ -f cache/state.json ]; then
-            echo "📄 state.json:"
-            cat cache/state.json
-          else
-            echo "⚠️ state.json не найден"
-          fi
-      
-      # Сохраняем с уникальным ключом
+      # === СОХРАНЕНИЕ КЭША ===
       - name: Save cache
         uses: actions/cache/save@v4
         if: always()
@@ -117,20 +71,17 @@ jobs:
           path: cache/
           key: kiber-sos-${{ github.run_id }}
       
-      # Чистим старые кэши
       - name: Cleanup old caches
         if: always()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "🧹 Очистка старых кэшей..."
           gh cache list --json id,key,createdAt \
             --jq '.[] | select(.key | startswith("kiber-sos-")) | .key' \
             | tail -n +6 \
             | while read key; do
-                echo "Удаляю: $key"
                 gh cache delete "$key" || true
               done
-          echo "✅ Готово"
+
 
