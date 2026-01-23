@@ -18,11 +18,20 @@ from aiogram.enums import ParseMode
 from aiogram.types import FSInputFile
 from openai import OpenAI
 
+# Попытка импортировать Copilot SDK (опционально)
+try:
+    from github_copilot_sdk import CopilotClient
+    COPILOT_SDK_AVAILABLE = True
+except ImportError:
+    COPILOT_SDK_AVAILABLE = False
+    print("⚠️ GitHub Copilot SDK не установлен, используется стандартный OpenAI API")
+
 # ============ CONFIG ============
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+USE_COPILOT_SDK = os.getenv("USE_COPILOT_SDK", "false").lower() == "true"
 
 if not all([OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, CHANNEL_ID]):
     raise ValueError("❌ Не все ENV переменные установлены!")
@@ -32,6 +41,16 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Инициализация Copilot SDK если доступен и включен
+copilot_client = None
+if COPILOT_SDK_AVAILABLE and USE_COPILOT_SDK:
+    try:
+        copilot_client = CopilotClient()
+        print("✅ GitHub Copilot SDK инициализирован")
+    except Exception as e:
+        print(f"⚠️ Не удалось инициализировать Copilot SDK: {e}")
+        print("   Используется стандартный OpenAI API")
 
 HEADERS = {
     "User-Agent": (
@@ -550,8 +569,72 @@ def load_rss(source: Dict) -> List[Dict]:
 
 # ============ TEXT GENERATION ============
 
+async def generate_post_with_copilot_sdk(article: Dict, post_type: Dict) -> Optional[str]:
+    """Генерация поста через Copilot SDK"""
+    if not copilot_client:
+        return None
+    
+    try:
+        # Получаем полный текст
+        full_text = fetch_full_article(article["link"])
+        content = full_text[:3000] if full_text else article["summary"]
+        
+        if full_text:
+            print(f"  📄 Получен полный текст: {len(full_text)} символов")
+        
+        user_message = f"""{post_type['template']}
+
+---
+ИСТОЧНИК:
+Заголовок: {article['title']}
+Текст: {content}
+Ссылка: {article['link']}
+---
+
+КРИТИЧЕСКИ ВАЖНО:
+1. Пиши ТОЛЬКО на основе информации из источника
+2. Если информации мало — напиши короче, но честно
+3. Никаких выдуманных инструкций
+"""
+        
+        # Создаём сессию с агентом
+        session = copilot_client.create_session(
+            system=post_type["system"],
+            temperature=0.6,
+            max_tokens=900
+        )
+        
+        # Отправляем запрос
+        response = await session.send_message(user_message)
+        text = response.text.strip()
+        
+        # Убираем кавычки
+        if text.startswith(('"', '«')) and text.endswith(('"', '»')):
+            text = text[1:-1].strip()
+        
+        if len(text) < 200:
+            return None
+        
+        final = build_final_post(text, article["link"], article["category"])
+        print(f"  ✅ SDK: {len(final)} символов")
+        return final
+        
+    except Exception as e:
+        print(f"  ❌ SDK ошибка: {e}")
+        return None
+
 def generate_post(article: Dict, post_type: Dict) -> Optional[str]:
-    # Пробуем получить полный текст
+    """Генерация поста (с fallback на OpenAI если SDK недоступен)"""
+    
+    # Пробуем Copilot SDK если включен
+    if copilot_client and USE_COPILOT_SDK:
+        print("  🤖 Используется Copilot SDK")
+        result = asyncio.run(generate_post_with_copilot_sdk(article, post_type))
+        if result:
+            return result
+        print("  ⚠️ SDK не сработал, переключаемся на OpenAI")
+    
+    # Fallback на стандартный OpenAI
     full_text = fetch_full_article(article["link"])
     
     content_for_gpt = article["summary"]
@@ -667,6 +750,11 @@ async def autopost():
     state.cleanup_old()
     print("🔄 Загрузка новостей...\n")
     
+    if copilot_client and USE_COPILOT_SDK:
+        print("🤖 Режим: GitHub Copilot SDK")
+    else:
+        print("🔧 Режим: OpenAI API")
+    
     # Собираем статьи из всех источников
     all_articles = []
     sources = state.get_next_source_order()
@@ -725,3 +813,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
