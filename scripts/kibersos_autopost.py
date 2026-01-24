@@ -7,352 +7,265 @@ import time
 import hashlib
 import html
 import urllib.parse
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from datetime import datetime
 
 import requests
 import feedparser
 from bs4 import BeautifulSoup
+from youtube_transcript_api import YouTubeTranscriptApi
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import FSInputFile
 from openai import OpenAI
 
-# ============ CONFIG ============
+# ============ КОНФИГУРАЦИЯ ============
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 
-if not all([OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, CHANNEL_ID]):
-    print("⚠️ WARNING: Keys not found!")
-
-bot = Bot(
-    token=TELEGRAM_BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
-
 CACHE_DIR = os.getenv("CACHE_DIR", "cache_sec")
 os.makedirs(CACHE_DIR, exist_ok=True)
-STATE_FILE = os.path.join(CACHE_DIR, "state_kiber.json")
+STATE_FILE = os.path.join(CACHE_DIR, "state_youtube_rss.json")
 
-RETENTION_DAYS = 14
-MAX_ARTICLE_AGE_DAYS = 2
-TELEGRAM_CAPTION_LIMIT = 1024
+# ============ ИСТОЧНИКИ (Я ВСЕ НАСТРОИЛ ЗА ТЕБЯ) ============
 
-# ============ НОВЫЕ ИСТОЧНИКИ (Для людей) ============
-
+# 1. RSS: Блоги про безопасность для людей
 RSS_SOURCES = [
-    # Kaspersky Daily (Блог для пользователей, идеально для советов)
-    {"name": "Kaspersky Daily", "url": "https://www.kaspersky.ru/blog/feed/", "category": "consumer"},
-    
-    # Код Дурова (Часто пишут про Telegram, утечки, блокировки)
-    {"name": "Kod.ru", "url": "https://kod.ru/rss/", "category": "tech"},
-    
-    # 3DNews (Раздел Software/Security - бывают новости про виндовс/софт)
-    {"name": "3DNews Soft", "url": "https://3dnews.ru/software/rss/", "category": "tech"},
-    
-    # Раздел безопасности на Хабре (оставляем, но будем фильтровать через GPT)
-    {"name": "Habr InfoSec", "url": "https://habr.com/ru/rss/hub/infosecurity/all/?fl=ru", "category": "security"},
-    
-    # Добавляем англоязычные (GPT переведет), там больше про Apple/Android/Scams
-    {"name": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/", "category": "security"},
-    {"name": "9to5Mac Security", "url": "https://9to5mac.com/guides/security/feed/", "category": "apple"},
+    # Kaspersky Daily (Простым языком)
+    {"name": "Kaspersky Daily", "url": "https://www.kaspersky.ru/blog/feed/", "type": "rss"},
+    # Код Дурова (Про Телеграм и соцсети)
+    {"name": "Kod.ru", "url": "https://kod.ru/rss/", "type": "rss"},
+    # BleepingComputer (Тут самые свежие новости про вирусы, GPT переведет)
+    {"name": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/", "type": "rss"},
+    # 3DNews Soft (Иногда бывает полезное про Windows/Android)
+    {"name": "3DNews Soft", "url": "https://3dnews.ru/software/rss/", "type": "rss"},
 ]
 
-# Дни недели, когда разрешены новости про БИЗНЕС (0=Пн, 1=Вт, ... 6=Вс)
-# Например: Вторник (1) и Четверг (3)
-BUSINESS_NEWS_DAYS = [1, 3] 
-
-# ============ ПРОМПТ ДЛЯ ФИЛЬТРАЦИИ И НАПИСАНИЯ ============
-
-POST_FORMAT = {
-    "system": """Ты — редактор канала "Кибербез для обычных людей". 
-Твоя задача — отобрать новость и переписать её просто и полезно.
-
-ГЛАВНОЕ ПРАВИЛО ФИЛЬТРАЦИИ:
-1. Если новость про: настройки серверов, Linux, DevOps, отчеты директоров, B2B рынок, сложные корпоративные взломы, которые не касаются данных физлиц — ответь одним словом: SKIP.
-2. Если новость про: WhatsApp, Telegram, iOS, Android, карты, мошенников, Wi-Fi, пароли, утечки данных пользователей, VPN — ПИШИ ПОСТ.
-
-ИСКЛЮЧЕНИЕ (Дни бизнеса):
-Если в поле SYSTEM_INSTRUCTION сказано "BUSINESS_ALLOWED", ты можешь написать про крупный взлом компании, но только если объяснишь, как это влияет на обычного человека.
-
-ФОРМАТ ПОСТА:
-- Заголовок с эмодзи.
-- Простым языком: что случилось.
-- Почему это важно мне (читателю).
-- Чёткая инструкция: что сделать прямо сейчас (обновить, сменить пароль, не нажимать).
-- Хештеги: #Кибербез #Советы
-""",
-    "template": """Проанализируй новость.
-Если это скучная корпоративная чушь — верни просто слово SKIP.
-Если это полезно для человека с телефоном/ноутбуком — напиши пост на русском языке.
-
-Title: {title}
-Summary: {summary}
-Full Text Fragment: {text_fragment}
-"""
-}
-
-# ============ ФИЛЬТРЫ (Первичные) ============
-# Сразу выкидываем мусор, чтобы не тратить деньги на API
-
-EXCLUDE_KEYWORDS = [
-    "назначен директором", "квартальный отчет", "акции упали", "маркетинг", 
-    "конференция", "вебинар", "cisco", "oracle", "vmware", "kubernetes", 
-    "devops", "selectel", "data center", "цод", "импортозамещ"
+# 2. YOUTUBE: Я добавил топ каналов про хакинг и защиту
+YOUTUBE_CHANNELS = [
+    # Overbafer1 (Русский, очень популярный про схемы развода)
+    {"name": "Overbafer1", "id": "UC-lHJ97lqoOGgsLFuQ8Y8_g"},
+    
+    # NetworkChuck (Англ, супер просто про хакинг - GPT переведет)
+    {"name": "NetworkChuck", "id": "UC9x0AN7BWHpXyPic4IQC74Q"},
+    
+    # The Hated One (Англ, всё про анонимность)
+    {"name": "The Hated One", "id": "UCjr2bPAyPV7t35mVihRBCzw"},
+    
+    # NN (Русский, новости технологий кратко)
+    {"name": "NN", "id": "UCfJkM0E6qT8j6w6q5x5x_9A"},
 ]
 
-def is_potentially_interesting(title: str, summary: str) -> bool:
-    text = f"{title} {summary}".lower()
-    # Если есть стоп-слова
-    if any(k in text for k in EXCLUDE_KEYWORDS): return False
-    return True
+# ============ ИНИЦИАЛИЗАЦИЯ ============
 
-# ============ STATE MANAGEMENT ============
+bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 class State:
     def __init__(self):
-        self.data = {"posted_ids": {}, "source_index": 0}
+        self.data = {"posted_ids": {}}
         self._load()
     
     def _load(self):
         if os.path.exists(STATE_FILE):
             try:
-                with open(STATE_FILE, "r", encoding="utf-8") as f: 
-                    self.data.update(json.load(f))
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    self.data = json.load(f)
             except: pass
     
     def save(self):
-        try:
-            with open(STATE_FILE, "w", encoding="utf-8") as f: 
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
-        except: pass
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, indent=2, ensure_ascii=False)
     
-    def get_article_id(self, title: str, link: str) -> str:
-        return hashlib.sha256(f"{title}|{link}".encode()).hexdigest()[:20]
-
-    def is_posted(self, title: str, link: str) -> bool:
-        return self.get_article_id(title, link) in self.data["posted_ids"]
+    def is_posted(self, uid):
+        return uid in self.data["posted_ids"]
     
-    def mark_posted(self, title: str, link: str):
-        aid = self.get_article_id(title, link)
-        self.data["posted_ids"][aid] = {"ts": datetime.now().timestamp()}
+    def mark_posted(self, uid):
+        # Храним последние 300 записей
+        if len(self.data["posted_ids"]) > 300:
+            sorted_ids = sorted(self.data["posted_ids"].items(), key=lambda x: x[1])
+            self.data["posted_ids"] = dict(sorted_ids[-200:])
+        self.data["posted_ids"][uid] = int(time.time())
         self.save()
-    
-    def cleanup_old(self):
-        cutoff = datetime.now().timestamp() - (RETENTION_DAYS * 86400)
-        self.data["posted_ids"] = {k: v for k, v in self.data["posted_ids"].items() if v.get("ts", 0) > cutoff}
-        self.save()
-
-    # Ротация источников, чтобы не спамить только с одного
-    def get_shuffled_sources(self) -> List[Dict]:
-        src = RSS_SOURCES.copy()
-        random.shuffle(src)
-        return src
 
 state = State()
 
-# ============ TEXT TOOLS ============
+# ============ ПАРСЕРЫ ============
 
-def clean_text(text: str) -> str:
+def clean_text(text):
     if not text: return ""
     text = re.sub(r'<[^>]+>', ' ', text)
-    text = html.unescape(text)
-    return " ".join(text.split())
+    return html.unescape(text).strip()
 
-def fetch_full_article(url: str) -> Optional[str]:
+def fetch_rss(source):
+    """Качает новости с сайтов"""
+    items = []
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        # Удаляем лишнее
-        for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'aside']): 
-            tag.decompose()
-        # Ищем основной текст (универсальный поиск)
-        content = soup.find('div', class_=re.compile(r'article|content|post|entry|news-body'))
-        if not content:
-            # Fallback - берем все параграфы
-            ps = soup.find_all('p')
-            return " ".join([p.get_text() for p in ps])[:3000]
+        feed = feedparser.parse(source['url'])
+        for entry in feed.entries[:3]:
+            uid = hashlib.md5(entry.link.encode()).hexdigest()
+            if state.is_posted(uid): continue
             
-        return clean_text(content.get_text())[:3000]
-    except: return None
+            items.append({
+                "type": "news", 
+                "title": entry.title, 
+                "text": clean_text(entry.get("summary", "")),
+                "link": entry.link, 
+                "source": source['name'], 
+                "uid": uid
+            })
+    except: pass
+    return items
 
-def build_final_post(text: str, link: str) -> str:
-    # Безопасно для HTML
-    # text = html.escape(text) # GPT обычно возвращает норм текст, но можно включить если будут баги
-    source = f'\n\n🔗 <a href="{link}">Источник</a>'
-    return text + source
-
-# ============ RSS LOAD ============
-
-def load_rss(source: Dict) -> List[Dict]:
-    articles = []
-    try:
-        resp = requests.get(source["url"], headers=HEADERS, timeout=15)
-        feed = feedparser.parse(resp.content)
-    except Exception as e: 
-        print(f"Error loading {source['name']}: {e}")
-        return []
-    
-    now = datetime.now()
-    for entry in feed.entries[:10]: # Берем только свежие 10
-        title = clean_text(entry.get("title", ""))
-        link = entry.get("link", "")
-        
-        if not title or not link: continue
-        if state.is_posted(title, link): continue
-        
-        # Проверка даты
-        pub_date = now
-        if hasattr(entry, "published_parsed") and entry.published_parsed:
-            try: pub_date = datetime(*entry.published_parsed[:6])
-            except: pass
-        if now - pub_date > timedelta(days=MAX_ARTICLE_AGE_DAYS): continue
-        
-        summary = clean_text(entry.get("summary", "") or entry.get("description", ""))
-        
-        # Первичный фильтр по ключевым словам
-        if not is_potentially_interesting(title, summary): 
-            continue
+def fetch_youtube():
+    """Качает субтитры с видео"""
+    items = []
+    for channel in YOUTUBE_CHANNELS:
+        try:
+            # Получаем RSS ленту канала (последние видео)
+            rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel['id']}"
+            feed = feedparser.parse(rss_url)
             
-        articles.append({
-            "title": title, "summary": summary[:1000], "link": link,
-            "source": source["name"], "date": pub_date
-        })
-    return articles
+            for entry in feed.entries[:2]: # Проверяем 2 последних видео
+                vid = entry.yt_videoid
+                uid = f"yt_{vid}"
+                if state.is_posted(uid): continue
+                
+                try:
+                    # Пытаемся достать субтитры (на любом языке)
+                    transcript_list = YouTubeTranscriptApi.list_transcripts(vid)
+                    # Ищем русские или английские
+                    transcript = transcript_list.find_transcript(['ru', 'en', 'de']).fetch()
+                    full_text = " ".join([t['text'] for t in transcript])
+                    
+                    items.append({
+                        "type": "video", 
+                        "title": entry.title, 
+                        "text": full_text[:4000], # Ограничиваем длину для GPT
+                        "link": entry.link, 
+                        "source": f"YouTube ({channel['name']})", 
+                        "uid": uid
+                    })
+                except: 
+                    # Часто у видео нет субтитров, это нормально, пропускаем
+                    pass
+        except: pass
+    return items
 
-# ============ GENERATION ============
+# ============ GPT ============
 
-async def generate_post_content(article: Dict) -> Optional[str]:
-    full_text = fetch_full_article(article["link"])
-    text_fragment = full_text if full_text else article["summary"]
+async def process_item(item):
+    """Превращает сырой текст в пост"""
     
-    # Проверяем, день бизнеса сегодня или нет
-    weekday = datetime.now().weekday()
-    system_instruction = POST_FORMAT["system"]
-    
-    if weekday in BUSINESS_NEWS_DAYS:
-        system_instruction += "\n\nSYSTEM_INSTRUCTION: BUSINESS_ALLOWED"
+    if item['type'] == 'video':
+        # Промпт для Видео
+        prompt = """Ты — автор канала "Кибербез".
+Тебе дали расшифровку видео с YouTube. 
+Твоя задача — сделать из этого короткий полезный пост-выжимку.
+1. Убери "воду" и приветствия.
+2. Выдели главную угрозу или совет.
+3. Напиши четкую инструкцию.
+
+Формат:
+🎥 [Название видео]
+💡 О чем речь: ...
+📝 Главные советы:
+• ...
+• ..."""
     else:
-        system_instruction += "\n\nSYSTEM_INSTRUCTION: CONSUMER_ONLY (STRICT)"
+        # Промпт для Новостей
+        prompt = """Ты редактор канала "Кибербез".
+Прочитай новость.
+Если это скучный отчет компании или про сервера/бизнес — ответь одним словом SKIP.
+Если это касается обычных людей (мошенники, телефоны, утечки паролей) — напиши пост.
+Стиль: простой, заботливый.
 
-    user_msg = POST_FORMAT["template"].format(
-        title=article['title'],
-        summary=article['summary'],
-        text_fragment=text_fragment[:2000]
-    )
-    
+Формат:
+⚠️ [Заголовок]
+ℹ️ Что случилось: ...
+🛡 Что делать: ..."""
+
     try:
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": user_msg}
-            ],
-            temperature=0.5,
-            max_tokens=1000
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": f"Title: {item['title']}\n\nText: {item['text']}"}
+            ]
         )
-        content = resp.choices[0].message.content.strip()
+        text = resp.choices[0].message.content.strip()
         
-        # Если GPT решил пропустить новость
-        if "SKIP" in content or len(content) < 50:
-            print(f"   🤖 AI решил пропустить: {article['title']}")
-            return None
-            
-        content = content.replace("**", "").replace('"', '')
-        return build_final_post(content, article["link"])
+        if "SKIP" in text or len(text) < 50: return None
+        
+        return text + f"\n\n🔗 <a href='{item['link']}'>Источник</a>"
     except Exception as e:
-        print(f"❌ OpenAI Error: {e}")
+        print(f"AI Error: {e}")
         return None
 
-# ============ IMAGE ============
-
-def generate_image(title: str) -> Optional[str]:
-    # Делаем промпт более "домашним", меньше матрицы, больше защиты гаджетов
-    clean_title = re.sub(r'[^a-zA-Z0-9]', ' ', title)[:50]
-    prompt = f"cybersecurity illustration, 3d icon style, simple, minimalist, shield protecting smartphone or laptop, soft lighting, blue and orange colors, {clean_title}"
-    
-    encoded = urllib.parse.quote(prompt)
-    url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&seed={random.randint(0,99999)}"
-    
+def generate_image(title):
     try:
-        resp = requests.get(url, timeout=20)
-        if resp.status_code == 200 and len(resp.content) > 5000:
-            fname = f"img_{int(time.time())}.jpg"
-            with open(fname, "wb") as f: f.write(resp.content)
-            return fname
+        # Рисуем абстракцию
+        clean_t = re.sub(r'[^a-zA-Z0-9]', ' ', title)[:50]
+        enc = urllib.parse.quote(f"cybersecurity 3d render shield smartphone protection {clean_t}")
+        url = f"https://image.pollinations.ai/prompt/{enc}?width=1024&height=1024&nologo=true&seed={random.randint(0,999)}"
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            path = os.path.join(CACHE_DIR, "temp_img.jpg")
+            with open(path, "wb") as f: f.write(r.content)
+            return path
     except: pass
     return None
 
-def cleanup_image(path):
-    if path and os.path.exists(path):
-        try: os.remove(path)
-        except: pass
-
-# ============ MAIN ============
-
-async def autopost():
-    state.cleanup_old()
-    print("🛡 [KiberSOS] Поиск новостей для обычных людей...")
-    
-    # Получаем список статей со всех источников в случайном порядке
-    all_candidates = []
-    sources = state.get_shuffled_sources()
-    
-    for source in sources:
-        print(f"📡 {source['name']}...")
-        all_candidates.extend(load_rss(source))
-    
-    # Сортируем: сначала свежие
-    all_candidates.sort(key=lambda x: x["date"], reverse=True)
-    
-    print(f"🔍 Найдено {len(all_candidates)} кандидатов. Фильтруем через GPT...")
-
-    posts_done = 0
-    
-    for article in all_candidates:
-        if posts_done >= 1: break # Постим только 1 новость за запуск
-        
-        print(f"📝 Анализ: {article['title']}")
-        
-        post_text = await generate_post_content(article)
-        
-        if not post_text:
-            # GPT вернул SKIP или ошибку - помечаем как "просмотрено", чтобы не дергать снова
-            # Но можно и не помечать, если хотите дать второй шанс. 
-            # Лучше пометить, чтобы экономить API.
-            state.mark_posted(article["title"], article["link"])
-            continue 
-        
-        # Если пост сгенерировался - отправляем
-        print("   📸 Генерирую картинку...")
-        img = generate_image(article["title"])
-        
-        try:
-            if img and len(post_text) <= TELEGRAM_CAPTION_LIMIT:
-                await bot.send_photo(CHANNEL_ID, photo=FSInputFile(img), caption=post_text)
-                cleanup_image(img)
-            else:
-                await bot.send_message(CHANNEL_ID, text=post_text, disable_web_page_preview=False)
-                if img: cleanup_image(img)
-            
-            print("✅ Опубликовано!")
-            state.mark_posted(article["title"], article["link"])
-            posts_done += 1
-            
-        except Exception as e:
-            print(f"❌ Ошибка отправки: {e}")
+# ============ START ============
 
 async def main():
-    try: await autopost()
-    finally: await bot.session.close()
+    print("🚀 Запуск (YouTube + RSS)...")
+    
+    # 1. Сбор данных
+    all_items = []
+    
+    print("...Сканирую YouTube каналы")
+    all_items.extend(fetch_youtube())
+    
+    print("...Сканирую RSS ленты")
+    for src in RSS_SOURCES:
+        all_items.extend(fetch_rss(src))
+        
+    print(f"📦 Найдено материалов: {len(all_items)}")
+    
+    # 2. Перемешиваем
+    random.shuffle(all_items)
+    
+    # 3. Публикация (1 пост)
+    for item in all_items:
+        print(f"⚙️ Проверка: {item['title']}")
+        post_text = await process_item(item)
+        
+        if post_text:
+            print("   ✅ Пост готов! Отправка...")
+            img_path = generate_image(item['title'])
+            
+            try:
+                if img_path:
+                    await bot.send_photo(CHANNEL_ID, photo=FSInputFile(img_path), caption=post_text)
+                    try: os.remove(img_path)
+                    except: pass
+                else:
+                    await bot.send_message(CHANNEL_ID, text=post_text)
+                
+                state.mark_posted(item['uid'])
+                print("   🎉 Успешно!")
+                break # Выходим после 1 успешного поста
+                
+            except Exception as e:
+                print(f"❌ Ошибка Telegram: {e}")
+        else:
+            # Если GPT вернул SKIP
+            state.mark_posted(item['uid'])
+
+    await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
