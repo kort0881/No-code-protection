@@ -1,5 +1,6 @@
-requests
-feedparser
 aiogram
 openai
+feedparser
 beautifulsoup4
+requests
+youtube-transcript-api
