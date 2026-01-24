@@ -38,75 +38,82 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# Папка для кэша
 CACHE_DIR = os.getenv("CACHE_DIR", "cache_sec")
 os.makedirs(CACHE_DIR, exist_ok=True)
 STATE_FILE = os.path.join(CACHE_DIR, "state_kiber.json")
 
 RETENTION_DAYS = 14
 MAX_ARTICLE_AGE_DAYS = 2
-TELEGRAM_CAPTION_LIMIT = 1024 # Лимит для фото
-TELEGRAM_TEXT_LIMIT = 4096    # Лимит для простого сообщения
+TELEGRAM_CAPTION_LIMIT = 1024
 
-# ============ ИСТОЧНИКИ ============
+# ============ НОВЫЕ ИСТОЧНИКИ (Для людей) ============
 
 RSS_SOURCES = [
-    {"name": "SecurityLab", "url": "https://www.securitylab.ru/rss/allnews/", "category": "security"},
-    {"name": "AntiMalware", "url": "https://www.anti-malware.ru/news/feed", "category": "security"},
+    # Kaspersky Daily (Блог для пользователей, идеально для советов)
+    {"name": "Kaspersky Daily", "url": "https://www.kaspersky.ru/blog/feed/", "category": "consumer"},
+    
+    # Код Дурова (Часто пишут про Telegram, утечки, блокировки)
+    {"name": "Kod.ru", "url": "https://kod.ru/rss/", "category": "tech"},
+    
+    # 3DNews (Раздел Software/Security - бывают новости про виндовс/софт)
+    {"name": "3DNews Soft", "url": "https://3dnews.ru/software/rss/", "category": "tech"},
+    
+    # Раздел безопасности на Хабре (оставляем, но будем фильтровать через GPT)
     {"name": "Habr InfoSec", "url": "https://habr.com/ru/rss/hub/infosecurity/all/?fl=ru", "category": "security"},
-    {"name": "Xakep.ru", "url": "https://xakep.ru/feed/", "category": "security"},
-    {"name": "CNews Security", "url": "https://www.cnews.ru/inc/rss/news_security.xml", "category": "security"},
+    
+    # Добавляем англоязычные (GPT переведет), там больше про Apple/Android/Scams
+    {"name": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/", "category": "security"},
+    {"name": "9to5Mac Security", "url": "https://9to5mac.com/guides/security/feed/", "category": "apple"},
 ]
 
-# ============ СТИЛЬ ПОСТА (ДЛЯ ЛЮДЕЙ) ============
+# Дни недели, когда разрешены новости про БИЗНЕС (0=Пн, 1=Вт, ... 6=Вс)
+# Например: Вторник (1) и Четверг (3)
+BUSINESS_NEWS_DAYS = [1, 3] 
+
+# ============ ПРОМПТ ДЛЯ ФИЛЬТРАЦИИ И НАПИСАНИЯ ============
 
 POST_FORMAT = {
-    "system": """Ты — эксперт по цифровой безопасности, который пишет для обычных людей.
-Твоя ЦЕЛЬ: Простым языком объяснить сложную угрозу и подсказать, как защититься.
+    "system": """Ты — редактор канала "Кибербез для обычных людей". 
+Твоя задача — отобрать новость и переписать её просто и полезно.
 
-АУДИТОРИЯ: Обычные пользователи.
-Им важно: "Украдут ли мои деньги?", "Взломают ли соцсети?".
+ГЛАВНОЕ ПРАВИЛО ФИЛЬТРАЦИИ:
+1. Если новость про: настройки серверов, Linux, DevOps, отчеты директоров, B2B рынок, сложные корпоративные взломы, которые не касаются данных физлиц — ответь одним словом: SKIP.
+2. Если новость про: WhatsApp, Telegram, iOS, Android, карты, мошенников, Wi-Fi, пароли, утечки данных пользователей, VPN — ПИШИ ПОСТ.
 
-СТИЛЬ:
-- Тон: Заботливый, предупреждающий, понятный.
-- Объясняй термины.
-- Используй эмодзи (⚠️, 🛑, 🛡).
-- Пиши подробно, мысль должна быть законченной.
-- Язык: Русский.
+ИСКЛЮЧЕНИЕ (Дни бизнеса):
+Если в поле SYSTEM_INSTRUCTION сказано "BUSINESS_ALLOWED", ты можешь написать про крупный взлом компании, но только если объяснишь, как это влияет на обычного человека.
+
+ФОРМАТ ПОСТА:
+- Заголовок с эмодзи.
+- Простым языком: что случилось.
+- Почему это важно мне (читателю).
+- Чёткая инструкция: что сделать прямо сейчас (обновить, сменить пароль, не нажимать).
+- Хештеги: #Кибербез #Советы
 """,
-    "template": """Напиши пост по этой структуре:
+    "template": """Проанализируй новость.
+Если это скучная корпоративная чушь — верни просто слово SKIP.
+Если это полезно для человека с телефоном/ноутбуком — напиши пост на русском языке.
 
-⚠️ [Заголовок: Суть угрозы понятными словами]
-
-🛑 ЧТО СЛУЧИЛОСЬ:
-[Опиши ситуацию просто. Кто атакует? Кого взломали?]
-
-🤔 ЧЕМ ЭТО ОПАСНО:
-[Последствия: Кража паролей? Потеря денег? Слежка?]
-
-🛡 КАК ЗАЩИТИТЬСЯ:
-• [Совет 1]
-• [Совет 2]
-
-#Кибербез #Безопасность #KiberSOS
+Title: {title}
+Summary: {summary}
+Full Text Fragment: {text_fragment}
 """
 }
 
-# ============ ФИЛЬТРЫ ============
+# ============ ФИЛЬТРЫ (Первичные) ============
+# Сразу выкидываем мусор, чтобы не тратить деньги на API
 
 EXCLUDE_KEYWORDS = [
-    "акции", "инвестиц", "квартальный отчет", "назначен", "маркетинг", 
-    "футбол", "хоккей", "фильм", "выборы", "криптовалют", "bitcoin", "nft", 
-    "распродажа", "скидк", "гейминг", "playstation", "xbox"
+    "назначен директором", "квартальный отчет", "акции упали", "маркетинг", 
+    "конференция", "вебинар", "cisco", "oracle", "vmware", "kubernetes", 
+    "devops", "selectel", "data center", "цод", "импортозамещ"
 ]
 
-def is_security_related(title: str, summary: str) -> bool:
-    kw = ["уязвим", "атак", "взлом", "patch", "update", "шифровал", "spyware", 
-          "backdoor", "rce", "cve", "фишинг", "ddos", "leak", "утечка", "троян", 
-          "0-day", "exploit", "ботнет", "linux", "root", "permission", "security",
-          "malware", "ransomware", "apt", "soc", "siem", "хакер", "мошенни"]
+def is_potentially_interesting(title: str, summary: str) -> bool:
     text = f"{title} {summary}".lower()
-    return any(k in text for k in kw)
+    # Если есть стоп-слова
+    if any(k in text for k in EXCLUDE_KEYWORDS): return False
+    return True
 
 # ============ STATE MANAGEMENT ============
 
@@ -143,13 +150,12 @@ class State:
         cutoff = datetime.now().timestamp() - (RETENTION_DAYS * 86400)
         self.data["posted_ids"] = {k: v for k, v in self.data["posted_ids"].items() if v.get("ts", 0) > cutoff}
         self.save()
-    
-    def get_next_source_order(self) -> List[Dict]:
-        idx = self.data.get("source_index", 0) % len(RSS_SOURCES)
-        ordered = RSS_SOURCES[idx:] + RSS_SOURCES[:idx]
-        self.data["source_index"] = (idx + 1) % len(RSS_SOURCES)
-        self.save()
-        return ordered
+
+    # Ротация источников, чтобы не спамить только с одного
+    def get_shuffled_sources(self) -> List[Dict]:
+        src = RSS_SOURCES.copy()
+        random.shuffle(src)
+        return src
 
 state = State()
 
@@ -163,17 +169,25 @@ def clean_text(text: str) -> str:
 
 def fetch_full_article(url: str) -> Optional[str]:
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = requests.get(url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(resp.text, 'html.parser')
-        for tag in soup(['script', 'style', 'nav', 'header', 'footer']): tag.decompose()
+        # Удаляем лишнее
+        for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'aside']): 
+            tag.decompose()
+        # Ищем основной текст (универсальный поиск)
         content = soup.find('div', class_=re.compile(r'article|content|post|entry|news-body'))
-        if content: return clean_text(content.get_text())[:3500]
-    except: pass
-    return None
+        if not content:
+            # Fallback - берем все параграфы
+            ps = soup.find_all('p')
+            return " ".join([p.get_text() for p in ps])[:3000]
+            
+        return clean_text(content.get_text())[:3000]
+    except: return None
 
 def build_final_post(text: str, link: str) -> str:
-    text = html.escape(text)
-    source = f'\n\n🔗 <a href="{link}">Читать источник</a>'
+    # Безопасно для HTML
+    # text = html.escape(text) # GPT обычно возвращает норм текст, но можно включить если будут баги
+    source = f'\n\n🔗 <a href="{link}">Источник</a>'
     return text + source
 
 # ============ RSS LOAD ============
@@ -181,57 +195,79 @@ def build_final_post(text: str, link: str) -> str:
 def load_rss(source: Dict) -> List[Dict]:
     articles = []
     try:
-        resp = requests.get(source["url"], headers=HEADERS, timeout=20)
+        resp = requests.get(source["url"], headers=HEADERS, timeout=15)
         feed = feedparser.parse(resp.content)
-    except: return []
+    except Exception as e: 
+        print(f"Error loading {source['name']}: {e}")
+        return []
     
     now = datetime.now()
-    for entry in feed.entries[:20]:
+    for entry in feed.entries[:10]: # Берем только свежие 10
         title = clean_text(entry.get("title", ""))
         link = entry.get("link", "")
-        if not title or not link: continue
         
+        if not title or not link: continue
         if state.is_posted(title, link): continue
         
+        # Проверка даты
         pub_date = now
         if hasattr(entry, "published_parsed") and entry.published_parsed:
             try: pub_date = datetime(*entry.published_parsed[:6])
             except: pass
-            
         if now - pub_date > timedelta(days=MAX_ARTICLE_AGE_DAYS): continue
         
         summary = clean_text(entry.get("summary", "") or entry.get("description", ""))
         
-        if any(k in (title+summary).lower() for k in EXCLUDE_KEYWORDS): continue
-        if not is_security_related(title, summary): continue
-        
+        # Первичный фильтр по ключевым словам
+        if not is_potentially_interesting(title, summary): 
+            continue
+            
         articles.append({
-            "title": title, "summary": summary[:1500], "link": link,
+            "title": title, "summary": summary[:1000], "link": link,
             "source": source["name"], "date": pub_date
         })
     return articles
 
 # ============ GENERATION ============
 
-async def generate_post(article: Dict) -> Optional[str]:
+async def generate_post_content(article: Dict) -> Optional[str]:
     full_text = fetch_full_article(article["link"])
-    content = full_text if full_text else article["summary"]
+    text_fragment = full_text if full_text else article["summary"]
     
-    msg = f"{POST_FORMAT['template']}\n\nDATA:\nTitle: {article['title']}\nSource: {article['source']}\nText: {content[:2500]}"
+    # Проверяем, день бизнеса сегодня или нет
+    weekday = datetime.now().weekday()
+    system_instruction = POST_FORMAT["system"]
+    
+    if weekday in BUSINESS_NEWS_DAYS:
+        system_instruction += "\n\nSYSTEM_INSTRUCTION: BUSINESS_ALLOWED"
+    else:
+        system_instruction += "\n\nSYSTEM_INSTRUCTION: CONSUMER_ONLY (STRICT)"
+
+    user_msg = POST_FORMAT["template"].format(
+        title=article['title'],
+        summary=article['summary'],
+        text_fragment=text_fragment[:2000]
+    )
     
     try:
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": POST_FORMAT["system"]},
-                {"role": "user", "content": msg}
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": user_msg}
             ],
-            temperature=0.6,
-            max_tokens=1500 # Даем свободу писать длиннее, если нужно
+            temperature=0.5,
+            max_tokens=1000
         )
-        text = resp.choices[0].message.content.strip()
-        text = text.replace("**", "").replace('"', '')
-        return build_final_post(text, article["link"])
+        content = resp.choices[0].message.content.strip()
+        
+        # Если GPT решил пропустить новость
+        if "SKIP" in content or len(content) < 50:
+            print(f"   🤖 AI решил пропустить: {article['title']}")
+            return None
+            
+        content = content.replace("**", "").replace('"', '')
+        return build_final_post(content, article["link"])
     except Exception as e:
         print(f"❌ OpenAI Error: {e}")
         return None
@@ -239,15 +275,16 @@ async def generate_post(article: Dict) -> Optional[str]:
 # ============ IMAGE ============
 
 def generate_image(title: str) -> Optional[str]:
-    clean_title = re.sub(r'[^a-zA-Z0-9]', ' ', title)[:40]
-    prompt = f"cybersecurity digital protection shield lock safety concept art, blue and white colors, high quality 8k render, {clean_title}"
+    # Делаем промпт более "домашним", меньше матрицы, больше защиты гаджетов
+    clean_title = re.sub(r'[^a-zA-Z0-9]', ' ', title)[:50]
+    prompt = f"cybersecurity illustration, 3d icon style, simple, minimalist, shield protecting smartphone or laptop, soft lighting, blue and orange colors, {clean_title}"
     
     encoded = urllib.parse.quote(prompt)
     url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&seed={random.randint(0,99999)}"
     
     try:
-        resp = requests.get(url, timeout=30)
-        if resp.status_code == 200 and len(resp.content) > 10000:
+        resp = requests.get(url, timeout=20)
+        if resp.status_code == 200 and len(resp.content) > 5000:
             fname = f"img_{int(time.time())}.jpg"
             with open(fname, "wb") as f: f.write(resp.content)
             return fname
@@ -263,56 +300,55 @@ def cleanup_image(path):
 
 async def autopost():
     state.cleanup_old()
-    print("🛡 [KiberSOS] Запуск анализа...")
+    print("🛡 [KiberSOS] Поиск новостей для обычных людей...")
     
-    all_articles = []
-    # Ротация
-    for source in state.get_next_source_order():
-        print(f"📡 Скан: {source['name']}")
-        all_articles.extend(load_rss(source))
+    # Получаем список статей со всех источников в случайном порядке
+    all_candidates = []
+    sources = state.get_shuffled_sources()
     
-    if not all_articles:
-        print("✅ Новых инцидентов нет.")
-        return
+    for source in sources:
+        print(f"📡 {source['name']}...")
+        all_candidates.extend(load_rss(source))
+    
+    # Сортируем: сначала свежие
+    all_candidates.sort(key=lambda x: x["date"], reverse=True)
+    
+    print(f"🔍 Найдено {len(all_candidates)} кандидатов. Фильтруем через GPT...")
 
-    all_articles.sort(key=lambda x: x["date"], reverse=True)
+    posts_done = 0
     
-    for article in all_articles[:10]:
-        print(f"\n📝 Обработка: {article['title']}")
+    for article in all_candidates:
+        if posts_done >= 1: break # Постим только 1 новость за запуск
         
-        post_text = await generate_post(article)
-        if not post_text: continue
+        print(f"📝 Анализ: {article['title']}")
         
-        # === ГЛАВНАЯ ЛОГИКА ВЫБОРА (ФОТО или ТЕКСТ) ===
+        post_text = await generate_post_content(article)
         
-        # Если текст короткий (влезает под картинку) -> Генерируем фото
-        if len(post_text) <= TELEGRAM_CAPTION_LIMIT:
-            print("   📸 Текст короткий, генерирую картинку...")
-            img = generate_image(article["title"])
-            
-            try:
-                if img:
-                    await bot.send_photo(CHANNEL_ID, photo=FSInputFile(img), caption=post_text)
-                    cleanup_image(img)
-                else:
-                    await bot.send_message(CHANNEL_ID, text=post_text, disable_web_page_preview=False)
-            except Exception as e:
-                print(f"❌ Ошибка отправки фото: {e}")
-                # Если с фото не вышло, пробуем просто текст
-                await bot.send_message(CHANNEL_ID, text=post_text)
-
-        # Если текст длинный -> Отправляем только текст (без картинки)
-        else:
-            print("   📜 Текст длинный, отправляю БЕЗ картинки (чтобы не резать)...")
-            try:
+        if not post_text:
+            # GPT вернул SKIP или ошибку - помечаем как "просмотрено", чтобы не дергать снова
+            # Но можно и не помечать, если хотите дать второй шанс. 
+            # Лучше пометить, чтобы экономить API.
+            state.mark_posted(article["title"], article["link"])
+            continue 
+        
+        # Если пост сгенерировался - отправляем
+        print("   📸 Генерирую картинку...")
+        img = generate_image(article["title"])
+        
+        try:
+            if img and len(post_text) <= TELEGRAM_CAPTION_LIMIT:
+                await bot.send_photo(CHANNEL_ID, photo=FSInputFile(img), caption=post_text)
+                cleanup_image(img)
+            else:
                 await bot.send_message(CHANNEL_ID, text=post_text, disable_web_page_preview=False)
-            except Exception as e:
-                print(f"❌ Ошибка отправки текста: {e}")
-        
-        # Если успешно отправили
-        state.mark_posted(article["title"], article["link"])
-        print("✅ Опубликовано!")
-        return # 1 пост за запуск
+                if img: cleanup_image(img)
+            
+            print("✅ Опубликовано!")
+            state.mark_posted(article["title"], article["link"])
+            posts_done += 1
+            
+        except Exception as e:
+            print(f"❌ Ошибка отправки: {e}")
 
 async def main():
     try: await autopost()
