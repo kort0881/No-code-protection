@@ -2,17 +2,16 @@ name: KIBER SOS Autopost
 
 on:
   schedule:
-    # Запуск в 06:00, 09:00, 12:00, 18:00 (UTC)
-    - cron: '0 6,9,12,18 * * *'
+    # Запуск каждые 4 часа
+    - cron: '0 */4 * * *'
   workflow_dispatch:
 
 permissions:
-  contents: write # Разрешаем боту сохранять файл истории
+  contents: write
 
 jobs:
   autopost:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     
     steps:
       - name: Checkout repository
@@ -25,28 +24,22 @@ jobs:
       
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          pip install --upgrade pip
           pip install -r requirements.txt
       
-      # Запуск бота (без Copilot)
       - name: Run KIBER SOS autopost
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
-          # Кэш будет лежать в папке cache_sec внутри репозитория
           CACHE_DIR: cache_sec
         run: python scripts/kibersos_autopost.py
       
-      # === СОХРАНЕНИЕ ИСТОРИИ (GIT COMMIT) ===
-      # Это надежнее, чем actions/cache. Файл сохраняется навсегда.
       - name: Commit state
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "KiberSOS Bot"
-          # Добавляем папку с кэшем
           git add cache_sec/
-          # Если есть изменения — сохраняем
           git diff --quiet && git diff --staged --quiet || (git commit -m "Update history [skip ci]" && git push)
 
 
