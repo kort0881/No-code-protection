@@ -1,6 +1,6 @@
 aiogram
 openai
+aiohttp
 feedparser
-beautifulsoup4
-requests
 youtube-transcript-api
+beautifulsoup4
