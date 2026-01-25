@@ -27,7 +27,10 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 
 CACHE_DIR = os.getenv("CACHE_DIR", "cache_sec")
 os.makedirs(CACHE_DIR, exist_ok=True)
-STATE_FILE = os.path.join(CACHE_DIR, "state_smart_v2.json") # Версия 2 (умная)
+STATE_FILE = os.path.join(CACHE_DIR, "state_smart_v3.json")
+
+# Лимит символов, после которого мы отказываемся от картинки в пользу текста
+TEXT_ONLY_THRESHOLD = 850 
 
 # ============ ИСТОЧНИКИ ============
 
@@ -36,8 +39,8 @@ RSS_SOURCES = [
     {"name": "Kod.ru", "url": "https://kod.ru/rss/", "type": "rss"},
     {"name": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/", "type": "rss"},
     {"name": "3DNews Soft", "url": "https://3dnews.ru/software/rss/", "type": "rss"},
-    # Хабр часто пишет дубли, но мы их теперь отловим
     {"name": "Habr Security", "url": "https://habr.com/ru/rss/hub/infosecurity/all/?fl=ru", "type": "rss"},
+    {"name": "SecurityLab", "url": "https://www.securitylab.ru/rss/news/", "type": "rss"},
 ]
 
 YOUTUBE_CHANNELS = [
@@ -54,7 +57,6 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 class State:
     def __init__(self):
-        # Храним ID постов И список последних заголовков для проверки дублей
         self.data = {"posted_ids": {}, "recent_titles": []}
         self._load()
     
@@ -62,11 +64,8 @@ class State:
         if os.path.exists(STATE_FILE):
             try:
                 with open(STATE_FILE, "r", encoding="utf-8") as f:
-                    loaded = json.load(f)
-                    self.data.update(loaded)
-                    # Если в старом файле не было ключа recent_titles, создадим
-                    if "recent_titles" not in self.data:
-                        self.data["recent_titles"] = []
+                    self.data.update(json.load(f))
+                    if "recent_titles" not in self.data: self.data["recent_titles"] = []
             except: pass
     
     def save(self):
@@ -77,110 +76,79 @@ class State:
         return uid in self.data["posted_ids"]
     
     def mark_posted(self, uid, title):
-        # 1. Сохраняем ID (техническая уникальность ссылки)
         if len(self.data["posted_ids"]) > 300:
             sorted_ids = sorted(self.data["posted_ids"].items(), key=lambda x: x[1])
             self.data["posted_ids"] = dict(sorted_ids[-200:])
         self.data["posted_ids"][uid] = int(time.time())
         
-        # 2. Сохраняем Заголовок (смысловая уникальность)
-        # Храним последние 40 заголовков
         self.data["recent_titles"].append(title)
         if len(self.data["recent_titles"]) > 40:
             self.data["recent_titles"] = self.data["recent_titles"][-40:]
-            
         self.save()
 
     def get_recent_titles_str(self):
-        # Возвращаем список заголовков текстом для GPT
         return "\n".join(f"- {t}" for t in self.data["recent_titles"])
 
 state = State()
 
-# ============ ИНТЕЛЛЕКТУАЛЬНЫЕ ФУНКЦИИ ============
+# ============ УТИЛИТЫ ============
 
 def clean_text(text):
     if not text: return ""
     text = re.sub(r'<[^>]+>', ' ', text)
     return html.unescape(text).strip()
 
-async def check_duplicate_topic(new_title):
-    """
-    Спрашивает у GPT, не писали ли мы об этом недавно.
-    Это решает проблему '5 постов про наушники'.
-    """
-    recent_history = state.get_recent_titles_str()
-    if not recent_history:
-        return False # История пуста, дублей быть не может
+# ============ ПРОВЕРКА ДУБЛЕЙ ============
 
-    # Экономичный промпт для проверки
+async def check_duplicate_topic(new_title):
+    recent_history = state.get_recent_titles_str()
+    if not recent_history: return False
+
     prompt = f"""Ниже список последних новостей канала:
 {recent_history}
 
 Новая новость: "{new_title}"
 
-Вопрос: Говорится ли в новой новости РОВНО О ТОМ ЖЕ ИНЦИДЕНТЕ, что и в одной из прошлых? 
-(Например, если и там и там про 'взлом Bluetooth наушников JBL', ответь YES. Если темы похожи, но события разные - ответь NO).
-Ответь строго одно слово: YES или NO."""
+Вопрос: Это дубликат недавней темы? (Речь про то же событие?)
+Ответь YES или NO."""
 
     try:
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.0, # Нужна строгость, 0 фантазии
-            max_tokens=10
+            temperature=0, max_tokens=10
         )
-        answer = resp.choices[0].message.content.strip().upper()
-        if "YES" in answer:
-            return True # Это дубль!
-        return False
-    except:
-        return False
+        return "YES" in resp.choices[0].message.content.strip().upper()
+    except: return False
+
+# ============ ГЕНЕРАЦИЯ КАРТИНОК ============
 
 def generate_creative_image_prompt(title):
-    """
-    Создает разнообразные стили, чтобы не было скучных щитов.
-    """
-    
-    # 1. Стили (Визуальный ряд)
+    # Убрали банальные щиты и замки
     styles = [
-        "minimalist vector art, flat design, orange and dark blue",
-        "isometric 3d render, plastic material, soft lighting, pastel background",
-        "futuristic synthwave, neon purple and grid background, retro 80s style",
-        "digital watercolor painting, artistic, white background, abstract shapes",
-        "paper cut craft style, layered paper, depth of field",
-        "cinematic photorealistic close-up, dark moody lighting, bokeh",
-        "blueprint technical drawing, white lines on blue background, schematic"
+        "dark cyberpunk city atmosphere, neon rain, cinematic lighting",
+        "abstract data flow visualization, matrix style, green and black",
+        "minimalist glitch art, distorted reality, tech noir",
+        "isometric server room, stylized 3d render, soft blue lighting",
+        "retro vaporwave computer aesthetic, 80s style",
+        "detailed blueprint schematic, white lines on dark blue",
+        "double exposure, human silhouette filled with digital code"
     ]
     
-    # 2. Объекты (Сюжет)
+    # Объекты более абстрактные
     objects = [
-        "abstract digital shield protection",
-        "glowing padlock in digital space",
-        "smartphone with holographic barrier",
-        "laptop with warning glitch effect",
-        "anonymous hacker silhouette in hoodie",
-        "network nodes connecting safely",
-        "red alert warning sign 3d",
-        "matrix code rain falling on device"
+        "digital anomaly", "broken smartphone screen", "anonymous hacker hoodie", 
+        "network cables tangle", "red warning hologram", "secure usb key glowing"
     ]
     
-    selected_style = random.choice(styles)
-    selected_object = random.choice(objects)
-    
-    # Очищаем заголовок от мусора для промпта
     clean_t = re.sub(r'[^a-zA-Z0-9]', ' ', title)[:40]
-    
-    return f"{selected_object}, {clean_t}, {selected_style}, high quality, 4k"
+    return f"{random.choice(objects)}, {clean_t}, {random.choice(styles)}, high quality 8k"
 
 def generate_image(title):
     try:
-        # Используем креативный промпт
         prompt = generate_creative_image_prompt(title)
         enc = urllib.parse.quote(prompt)
-        # Добавляем seed, чтобы генерации были уникальными
-        url = f"https://image.pollinations.ai/prompt/{enc}?width=1024&height=1024&nologo=true&seed={random.randint(0,99999)}"
-        
+        url = f"https://image.pollinations.ai/prompt/{enc}?width=1280&height=720&nologo=true&seed={random.randint(0,99999)}"
         r = requests.get(url, timeout=20)
         if r.status_code == 200:
             path = os.path.join(CACHE_DIR, "temp_img.jpg")
@@ -197,9 +165,7 @@ def fetch_rss(source):
         feed = feedparser.parse(source['url'])
         for entry in feed.entries[:3]:
             uid = hashlib.md5(entry.link.encode()).hexdigest()
-            # Проверка по ссылке (быстрая)
             if state.is_posted(uid): continue
-            
             items.append({
                 "type": "news", "title": entry.title, 
                 "text": clean_text(entry.get("summary", "")),
@@ -216,7 +182,6 @@ def fetch_youtube():
             for entry in feed.entries[:2]:
                 vid = entry.yt_videoid
                 uid = f"yt_{vid}"
-                # Проверка по ссылке (быстрая)
                 if state.is_posted(uid): continue
                 try:
                     transcript = YouTubeTranscriptApi.list_transcripts(vid).find_transcript(['ru', 'en']).fetch()
@@ -229,34 +194,44 @@ def fetch_youtube():
         except: pass
     return items
 
-# ============ GPT ПРОЦЕССИНГ ============
+# ============ GPT: НАПИСАНИЕ ПОСТА ============
 
 async def process_item(item):
-    # Промпты для написания текста
     if item['type'] == 'video':
-        prompt = """Ты автор канала "Кибербез". Сделай из расшифровки видео короткий пост-выжимку.
-Убери воду. Выдели главную угрозу и дай инструкцию.
-Формат:
-🎥 [Название]
-💡 Суть: ...
-📝 Советы: ..."""
+        system_prompt = """Ты — автор профессионального канала по кибербезопасности.
+Тебе дали расшифровку видео.
+Твоя задача — сделать подробный разбор (Squeeze).
+Не пиши вступлений "В этом видео...". Сразу к сути.
+Структурируй текст: Заголовок, Проблема, Технические детали, Решение."""
     else:
-        prompt = """Ты редактор канала "Кибербез". Прочитай новость.
-1. Если это скучный отчет, B2B, сервера, конференции - ответь SKIP.
-2. Если это касается обычных людей (развод, телефоны, утечки, VPN) - напиши пост.
-Стиль: Простой, без паники, но полезный.
-Формат:
-⚠️ [Заголовок]
-ℹ️ Что случилось: ...
-🛡 Что делать: ..."""
+        # Промпт для новостей (УСИЛЕННЫЙ)
+        system_prompt = """Ты — ведущий аналитик по информационной безопасности.
+Твоя задача — написать глубокий, полезный пост для канала.
+
+Правила:
+1. Если исходная новость короткая — РАСШИРЬ её, используя свои общие знания по этой теме. Объясни техническую суть угрозы.
+2. Избегай банальностей ("будьте бдительны", "не переходите по ссылкам"). Давай конкретные инструкции (какие настройки отключить, какой софт проверить).
+3. Стиль: Профессиональный, но понятный. Без "детского сада" и лишних эмодзи.
+4. Если новость про бизнес/отчеты/назначения — верни SKIP.
+
+Структура поста:
+🔥 [Цепляющий заголовок]
+
+[Основной текст: суть проблемы, кого касается, технические детали]
+
+👇 ЧТО ДЕЛАТЬ:
+• [Конкретный совет 1]
+• [Конкретный совет 2]
+"""
 
     try:
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": prompt},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Title: {item['title']}\n\nText: {item['text']}"}
-            ]
+            ],
+            max_tokens=1500 # Разрешаем длинный ответ
         )
         text = resp.choices[0].message.content.strip()
         if "SKIP" in text or len(text) < 50: return None
@@ -275,45 +250,54 @@ async def main():
         all_items.extend(fetch_rss(src))
     
     random.shuffle(all_items)
-    print(f"📦 Candidates found: {len(all_items)}")
+    print(f"📦 Candidates: {len(all_items)}")
 
     for item in all_items:
         print(f"🔍 Analyzing: {item['title']}")
         
-        # --- ЭТАП 1: ПРОВЕРКА НА СМЫСЛОВОЙ ДУБЛЬ ---
-        # Спрашиваем у GPT, не было ли такой темы недавно
-        is_semantic_dup = await check_duplicate_topic(item['title'])
-        if is_semantic_dup:
-            print(f"   🚫 DUPLICATE TOPIC! (GPT says YES). Skipping.")
-            # Помечаем как обработанное, чтобы больше не тратить API на этот дубль
-            state.mark_posted(item['uid'], item['title']) 
+        # 1. Проверка дублей
+        if await check_duplicate_topic(item['title']):
+            print(f"   🚫 DUPLICATE TOPIC. Skipping.")
+            state.mark_posted(item['uid'], item['title'])
             continue
 
-        # --- ЭТАП 2: ГЕНЕРАЦИЯ ТЕКСТА ---
+        # 2. Генерация текста
         post_text = await process_item(item)
         
         if post_text:
-            print("   ✅ Text generated. Creating image...")
+            text_len = len(post_text)
+            print(f"   ✅ Post ready. Length: {text_len} chars.")
             
-            # --- ЭТАП 3: ГЕНЕРАЦИЯ КРАСИВОЙ КАРТИНКИ ---
-            # Теперь тут работают рандомные стили
-            img_path = generate_image(item['title'])
+            # 3. Решение: Картинка или Текст?
+            # Если пост длинный (>850 символов), отправляем БЕЗ картинки, чтобы не резать текст
+            if text_len > TEXT_ONLY_THRESHOLD:
+                print("   📜 Long read detected. Sending TEXT ONLY.")
+                try:
+                    await bot.send_message(CHANNEL_ID, text=post_text, disable_web_page_preview=False)
+                    print("   🎉 Posted text!")
+                    state.mark_posted(item['uid'], item['title'])
+                    break
+                except Exception as e:
+                    print(f"❌ Telegram Error: {e}")
             
-            try:
-                if img_path:
-                    await bot.send_photo(CHANNEL_ID, photo=FSInputFile(img_path), caption=post_text)
-                    os.remove(img_path)
-                else:
-                    await bot.send_message(CHANNEL_ID, text=post_text)
-                
-                print("   🎉 Posted successfully!")
-                # Записываем и ID, и Заголовок в историю
-                state.mark_posted(item['uid'], item['title'])
-                break # 1 пост за запуск
-            except Exception as e:
-                print(f"❌ Telegram Error: {e}")
+            # Если пост короткий, делаем красивую картинку
+            else:
+                print("   📸 Short read. Generating IMAGE.")
+                img_path = generate_image(item['title'])
+                try:
+                    if img_path:
+                        await bot.send_photo(CHANNEL_ID, photo=FSInputFile(img_path), caption=post_text)
+                        os.remove(img_path)
+                    else:
+                        await bot.send_message(CHANNEL_ID, text=post_text)
+                    
+                    print("   🎉 Posted with image!")
+                    state.mark_posted(item['uid'], item['title'])
+                    break
+                except Exception as e:
+                    print(f"❌ Telegram Error: {e}")
+
         else:
-            # Если GPT ответил SKIP (скучная новость)
             state.mark_posted(item['uid'], item['title'])
 
     await bot.session.close()
