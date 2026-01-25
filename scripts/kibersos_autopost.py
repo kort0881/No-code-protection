@@ -7,11 +7,15 @@ import time
 import hashlib
 import html
 import urllib.parse
+import tempfile
+import shutil
+import logging
 from datetime import datetime
+from dataclasses import dataclass
+from typing import Literal
 
-import requests
+import aiohttp
 import feedparser
-from bs4 import BeautifulSoup
 from youtube_transcript_api import YouTubeTranscriptApi
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -19,18 +23,42 @@ from aiogram.enums import ParseMode
 from aiogram.types import FSInputFile
 from openai import OpenAI
 
+# ============ ЛОГИРОВАНИЕ ============
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger("KiberSOS")
+
 # ============ КОНФИГУРАЦИЯ ============
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
+def get_env(name: str) -> str:
+    val = os.getenv(name)
+    if not val:
+        logger.error(f"Missing env variable: {name}")
+        exit(1)
+    return val
+
+OPENAI_API_KEY = get_env("OPENAI_API_KEY")
+TELEGRAM_BOT_TOKEN = get_env("TELEGRAM_BOT_TOKEN")
+CHANNEL_ID = get_env("CHANNEL_ID")
 
 CACHE_DIR = os.getenv("CACHE_DIR", "cache_sec")
 os.makedirs(CACHE_DIR, exist_ok=True)
 STATE_FILE = os.path.join(CACHE_DIR, "state_smart_v3.json")
 
-# Лимит символов, после которого мы отказываемся от картинки в пользу текста
-TEXT_ONLY_THRESHOLD = 850 
+# Лимиты
+TELEGRAM_CAPTION_LIMIT = 1024
+TELEGRAM_MESSAGE_LIMIT = 4096
+TEXT_ONLY_THRESHOLD = 850
+MAX_POSTED_IDS = 400
+POSTED_IDS_TRIM_TO = 300
+
+# Таймауты
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=25)
+IMAGE_TIMEOUT = aiohttp.ClientTimeout(total=40)
 
 # ============ ИСТОЧНИКИ ============
 
@@ -50,10 +78,21 @@ YOUTUBE_CHANNELS = [
     {"name": "NN", "id": "UCfJkM0E6qT8j6w6q5x5x_9A"},
 ]
 
-# ============ ИНИЦИАЛИЗАЦИЯ ============
+@dataclass
+class NewsItem:
+    type: Literal["news", "video"]
+    title: str
+    text: str
+    link: str
+    source: str
+    uid: str
+
+# ============ INIT ============
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ============ STATE MANAGEMENT ============
 
 class State:
     def __init__(self):
@@ -66,24 +105,36 @@ class State:
                 with open(STATE_FILE, "r", encoding="utf-8") as f:
                     self.data.update(json.load(f))
                     if "recent_titles" not in self.data: self.data["recent_titles"] = []
-            except: pass
+            except Exception as e:
+                logger.error(f"State load error: {e}")
     
     def save(self):
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, indent=2, ensure_ascii=False)
+        # Атомарное сохранение (защита от краша во время записи)
+        fd, tmp_path = tempfile.mkstemp(dir=CACHE_DIR, suffix='.json')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+            shutil.move(tmp_path, STATE_FILE)
+        except Exception as e:
+            logger.error(f"State save error: {e}")
+            if os.path.exists(tmp_path): os.unlink(tmp_path)
     
     def is_posted(self, uid):
         return uid in self.data["posted_ids"]
     
     def mark_posted(self, uid, title):
-        if len(self.data["posted_ids"]) > 300:
+        # Чистка старых ID
+        if len(self.data["posted_ids"]) > MAX_POSTED_IDS:
             sorted_ids = sorted(self.data["posted_ids"].items(), key=lambda x: x[1])
-            self.data["posted_ids"] = dict(sorted_ids[-200:])
+            self.data["posted_ids"] = dict(sorted_ids[-POSTED_IDS_TRIM_TO:])
+        
         self.data["posted_ids"][uid] = int(time.time())
         
+        # Чистка старых заголовков
         self.data["recent_titles"].append(title)
         if len(self.data["recent_titles"]) > 40:
             self.data["recent_titles"] = self.data["recent_titles"][-40:]
+        
         self.save()
 
     def get_recent_titles_str(self):
@@ -91,214 +142,224 @@ class State:
 
 state = State()
 
-# ============ УТИЛИТЫ ============
+# ============ TEXT UTILS ============
 
 def clean_text(text):
     if not text: return ""
     text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
     return html.unescape(text).strip()
 
-# ============ ПРОВЕРКА ДУБЛЕЙ ============
+def split_text(text, max_len=4090):
+    if len(text) <= max_len: return [text]
+    chunks = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        # Ищем ближайший перенос строки или пробел
+        split_idx = text.rfind('\n', 0, max_len)
+        if split_idx == -1: split_idx = text.rfind(' ', 0, max_len)
+        if split_idx == -1: split_idx = max_len
+        
+        chunks.append(text[:split_idx])
+        text = text[split_idx:].strip()
+    return chunks
+
+# ============ DUPLICATE CHECK ============
 
 async def check_duplicate_topic(new_title):
-    recent_history = state.get_recent_titles_str()
-    if not recent_history: return False
+    history = state.get_recent_titles_str()
+    if not history: return False
 
-    prompt = f"""Ниже список последних новостей канала:
-{recent_history}
+    prompt = f"""Ниже последние новости канала:
+{history}
 
 Новая новость: "{new_title}"
-
-Вопрос: Это дубликат недавней темы? (Речь про то же событие?)
+Вопрос: Это та же самая новость/инцидент, что и одна из прошлых?
 Ответь YES или NO."""
 
     try:
-        resp = openai_client.chat.completions.create(
+        resp = await asyncio.to_thread(lambda: openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0, max_tokens=10
-        )
-        return "YES" in resp.choices[0].message.content.strip().upper()
+            temperature=0, max_tokens=5
+        ))
+        is_dup = "YES" in resp.choices[0].message.content.strip().upper()
+        if is_dup: logger.info(f"🚫 Duplicate detected: {new_title}")
+        return is_dup
     except: return False
 
-# ============ ГЕНЕРАЦИЯ КАРТИНОК ============
+# ============ IMAGES ============
 
-def generate_creative_image_prompt(title):
-    # Убрали банальные щиты и замки
+def generate_prompt(title):
     styles = [
-        "dark cyberpunk city atmosphere, neon rain, cinematic lighting",
-        "abstract data flow visualization, matrix style, green and black",
-        "minimalist glitch art, distorted reality, tech noir",
+        "dark cyberpunk city atmosphere, neon rain, cinematic lighting, 8k",
+        "abstract data flow visualization, matrix style, green and black code",
+        "minimalist glitch art, distorted reality, tech noir aesthetic",
         "isometric server room, stylized 3d render, soft blue lighting",
-        "retro vaporwave computer aesthetic, 80s style",
-        "detailed blueprint schematic, white lines on dark blue",
-        "double exposure, human silhouette filled with digital code"
+        "detailed blueprint schematic, white lines on dark blue background"
     ]
+    obj = ["digital anomaly", "broken smartphone screen", "anonymous hacker", "red warning hologram"]
     
-    # Объекты более абстрактные
-    objects = [
-        "digital anomaly", "broken smartphone screen", "anonymous hacker hoodie", 
-        "network cables tangle", "red warning hologram", "secure usb key glowing"
-    ]
-    
-    clean_t = re.sub(r'[^a-zA-Z0-9]', ' ', title)[:40]
-    return f"{random.choice(objects)}, {clean_t}, {random.choice(styles)}, high quality 8k"
+    clean_t = re.sub(r'[^a-zA-Z0-9\s]', '', title)[:40]
+    return f"{random.choice(obj)}, {clean_t}, {random.choice(styles)}"
 
-def generate_image(title):
+async def generate_image(title, session):
     try:
-        prompt = generate_creative_image_prompt(title)
-        enc = urllib.parse.quote(prompt)
-        url = f"https://image.pollinations.ai/prompt/{enc}?width=1280&height=720&nologo=true&seed={random.randint(0,99999)}"
-        r = requests.get(url, timeout=20)
-        if r.status_code == 200:
-            path = os.path.join(CACHE_DIR, "temp_img.jpg")
-            with open(path, "wb") as f: f.write(r.content)
-            return path
-    except: pass
+        prompt = generate_prompt(title)
+        encoded = urllib.parse.quote(prompt)
+        seed = random.randint(0, 99999)
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=720&nologo=true&seed={seed}"
+        
+        async with session.get(url, timeout=IMAGE_TIMEOUT) as resp:
+            if resp.status == 200:
+                data = await resp.read()
+                if len(data) > 1000:
+                    path = os.path.join(CACHE_DIR, f"img_{int(time.time())}.jpg")
+                    with open(path, "wb") as f: f.write(data)
+                    return path
+    except Exception as e:
+        logger.warning(f"Image gen failed: {e}")
     return None
 
-# ============ ПАРСЕРЫ ============
+# ============ FETCHERS ============
 
-def fetch_rss(source):
+async def fetch_rss_feed(source, session):
     items = []
     try:
-        feed = feedparser.parse(source['url'])
+        async with session.get(source['url'], timeout=HTTP_TIMEOUT) as resp:
+            if resp.status != 200: return []
+            text = await resp.text()
+            
+        feed = feedparser.parse(text)
         for entry in feed.entries[:3]:
-            uid = hashlib.md5(entry.link.encode()).hexdigest()
+            link = entry.get('link')
+            if not link: continue
+            
+            uid = hashlib.md5(link.encode()).hexdigest()
             if state.is_posted(uid): continue
-            items.append({
-                "type": "news", "title": entry.title, 
-                "text": clean_text(entry.get("summary", "")),
-                "link": entry.link, "source": source['name'], "uid": uid
-            })
-    except: pass
+            
+            items.append(NewsItem(
+                type="news", title=entry.get('title', ''), 
+                text=clean_text(entry.get("summary", "")),
+                link=link, source=source['name'], uid=uid
+            ))
+    except Exception as e:
+        logger.warning(f"RSS error {source['name']}: {e}")
     return items
 
-def fetch_youtube():
+async def fetch_single_youtube(channel, session):
     items = []
-    for channel in YOUTUBE_CHANNELS:
-        try:
-            feed = feedparser.parse(f"https://www.youtube.com/feeds/videos.xml?channel_id={channel['id']}")
-            for entry in feed.entries[:2]:
-                vid = entry.yt_videoid
-                uid = f"yt_{vid}"
-                if state.is_posted(uid): continue
-                try:
-                    transcript = YouTubeTranscriptApi.list_transcripts(vid).find_transcript(['ru', 'en']).fetch()
-                    full_text = " ".join([t['text'] for t in transcript])
-                    items.append({
-                        "type": "video", "title": entry.title, "text": full_text[:4000],
-                        "link": entry.link, "source": f"YouTube {channel['name']}", "uid": uid
-                    })
-                except: pass
-        except: pass
+    try:
+        url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel['id']}"
+        async with session.get(url, timeout=HTTP_TIMEOUT) as resp:
+            if resp.status != 200: return []
+            text = await resp.text()
+            
+        feed = feedparser.parse(text)
+        for entry in feed.entries[:2]:
+            vid = entry.get('yt_videoid')
+            uid = f"yt_{vid}"
+            if state.is_posted(uid): continue
+            
+            # Транскрипт (синхронный, в потоке)
+            try:
+                transcript = await asyncio.to_thread(lambda: 
+                    YouTubeTranscriptApi.list_transcripts(vid).find_transcript(['ru', 'en']).fetch()
+                )
+                full_text = " ".join([t['text'] for t in transcript])
+                items.append(NewsItem(
+                    type="video", title=entry.title, text=full_text[:5000],
+                    link=entry.link, source=f"YouTube {channel['name']}", uid=uid
+                ))
+            except: pass
+    except Exception as e:
+        logger.warning(f"YT error {channel['name']}: {e}")
     return items
 
-# ============ GPT: НАПИСАНИЕ ПОСТА ============
+# ============ GPT & POST ============
 
-async def process_item(item):
-    if item['type'] == 'video':
-        system_prompt = """Ты — автор профессионального канала по кибербезопасности.
-Тебе дали расшифровку видео.
-Твоя задача — сделать подробный разбор (Squeeze).
-Не пиши вступлений "В этом видео...". Сразу к сути.
-Структурируй текст: Заголовок, Проблема, Технические детали, Решение."""
+async def generate_post_content(item):
+    if item.type == 'video':
+        prompt = "Ты автор канала. Сделай краткий разбор видео (Squeeze). Без воды. Структура: Заголовок, Проблема, Решение."
     else:
-        # Промпт для новостей (УСИЛЕННЫЙ)
-        system_prompt = """Ты — ведущий аналитик по информационной безопасности.
-Твоя задача — написать глубокий, полезный пост для канала.
-
+        prompt = """Ты ведущий аналитик кибербезопасности. Напиши пост для канала.
 Правила:
-1. Если исходная новость короткая — РАСШИРЬ её, используя свои общие знания по этой теме. Объясни техническую суть угрозы.
-2. Избегай банальностей ("будьте бдительны", "не переходите по ссылкам"). Давай конкретные инструкции (какие настройки отключить, какой софт проверить).
-3. Стиль: Профессиональный, но понятный. Без "детского сада" и лишних эмодзи.
-4. Если новость про бизнес/отчеты/назначения — верни SKIP.
+1. Если новость короткая - РАСШИРЬ её техническими деталями.
+2. Давай конкретные инструкции (что нажать, что удалить).
+3. Без банальностей "будьте бдительны".
+4. Если новость про бизнес/отчеты - SKIP.
 
-Структура поста:
+Структура:
 🔥 [Цепляющий заголовок]
-
-[Основной текст: суть проблемы, кого касается, технические детали]
-
+[Суть и детали]
 👇 ЧТО ДЕЛАТЬ:
-• [Конкретный совет 1]
-• [Конкретный совет 2]
-"""
+• [Совет 1]
+• [Совет 2]"""
 
     try:
-        resp = openai_client.chat.completions.create(
+        resp = await asyncio.to_thread(lambda: openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Title: {item['title']}\n\nText: {item['text']}"}
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": f"Title: {item.title}\nText: {item.text}"}
             ],
-            max_tokens=1500 # Разрешаем длинный ответ
-        )
+            max_tokens=2000
+        ))
         text = resp.choices[0].message.content.strip()
         if "SKIP" in text or len(text) < 50: return None
-        return text + f"\n\n🔗 <a href='{item['link']}'>Источник</a>"
+        return text + f"\n\n🔗 <a href='{item.link}'>Источник</a>"
     except Exception as e:
-        print(f"AI Error: {e}")
+        logger.error(f"GPT error: {e}")
         return None
 
-# ============ MAIN ============
+# ============ MAIN LOOP ============
 
 async def main():
-    print("🚀 Start scan...")
-    all_items = []
-    all_items.extend(fetch_youtube())
-    for src in RSS_SOURCES:
-        all_items.extend(fetch_rss(src))
-    
-    random.shuffle(all_items)
-    print(f"📦 Candidates: {len(all_items)}")
-
-    for item in all_items:
-        print(f"🔍 Analyzing: {item['title']}")
+    logger.info("🚀 Starting scan...")
+    async with aiohttp.ClientSession() as session:
+        # Параллельный запуск всех задач
+        tasks = [fetch_rss_feed(s, session) for s in RSS_SOURCES] + \
+                [fetch_single_youtube(c, session) for c in YOUTUBE_CHANNELS]
         
-        # 1. Проверка дублей
-        if await check_duplicate_topic(item['title']):
-            print(f"   🚫 DUPLICATE TOPIC. Skipping.")
-            state.mark_posted(item['uid'], item['title'])
-            continue
-
-        # 2. Генерация текста
-        post_text = await process_item(item)
+        results = await asyncio.gather(*tasks)
+        all_items = [item for sublist in results for item in sublist]
         
-        if post_text:
-            text_len = len(post_text)
-            print(f"   ✅ Post ready. Length: {text_len} chars.")
+        logger.info(f"📦 Found {len(all_items)} raw items")
+        random.shuffle(all_items)
+        
+        for item in all_items:
+            logger.info(f"🔍 Analyzing: {item.title}")
             
-            # 3. Решение: Картинка или Текст?
-            # Если пост длинный (>850 символов), отправляем БЕЗ картинки, чтобы не резать текст
-            if text_len > TEXT_ONLY_THRESHOLD:
-                print("   📜 Long read detected. Sending TEXT ONLY.")
-                try:
+            if await check_duplicate_topic(item.title):
+                state.mark_posted(item.uid, item.title)
+                continue
+            
+            post_text = await generate_post_content(item)
+            if not post_text:
+                state.mark_posted(item.uid, item.title)
+                continue
+            
+            # Постинг
+            try:
+                if len(post_text) > TEXT_ONLY_THRESHOLD:
+                    logger.info("📜 Long read -> Text only")
                     await bot.send_message(CHANNEL_ID, text=post_text, disable_web_page_preview=False)
-                    print("   🎉 Posted text!")
-                    state.mark_posted(item['uid'], item['title'])
-                    break
-                except Exception as e:
-                    print(f"❌ Telegram Error: {e}")
-            
-            # Если пост короткий, делаем красивую картинку
-            else:
-                print("   📸 Short read. Generating IMAGE.")
-                img_path = generate_image(item['title'])
-                try:
-                    if img_path:
-                        await bot.send_photo(CHANNEL_ID, photo=FSInputFile(img_path), caption=post_text)
-                        os.remove(img_path)
+                else:
+                    logger.info("📸 Short read -> Image + Text")
+                    img = await generate_image(item.title, session)
+                    if img:
+                        await bot.send_photo(CHANNEL_ID, photo=FSInputFile(img), caption=post_text)
+                        os.remove(img)
                     else:
                         await bot.send_message(CHANNEL_ID, text=post_text)
-                    
-                    print("   🎉 Posted with image!")
-                    state.mark_posted(item['uid'], item['title'])
-                    break
-                except Exception as e:
-                    print(f"❌ Telegram Error: {e}")
-
-        else:
-            state.mark_posted(item['uid'], item['title'])
+                
+                logger.info("✅ Success!")
+                state.mark_posted(item.uid, item.title)
+                break # 1 пост за раз
+            except Exception as e:
+                logger.error(f"Telegram error: {e}")
 
     await bot.session.close()
 
