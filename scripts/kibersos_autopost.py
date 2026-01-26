@@ -60,6 +60,15 @@ POSTED_IDS_TRIM_TO = 300
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=25)
 IMAGE_TIMEOUT = aiohttp.ClientTimeout(total=40)
 
+# ⛔️ ЧЕРНЫЙ СПИСОК (СТОП-СЛОВА)
+# Если эти слова есть в заголовке - новость летит в мусорку СРАЗУ.
+# Пиши сюда всё, что тебя достало.
+STOP_WORDS = [
+    "наушник", "jbl", "bluetooth", "блютуз", 
+    "гарнитур", "headphone", "earbud", 
+    "квартальный отчет", "назначен директором", "маркетинг"
+]
+
 # ============ ИСТОЧНИКИ ============
 
 RSS_SOURCES = [
@@ -105,11 +114,16 @@ class State:
                 with open(STATE_FILE, "r", encoding="utf-8") as f:
                     self.data.update(json.load(f))
                     if "recent_titles" not in self.data: self.data["recent_titles"] = []
+                
+                # Логируем память, чтобы убедиться, что она работает
+                count = len(self.data["recent_titles"])
+                last_3 = self.data["recent_titles"][-3:] if count > 0 else []
+                logger.info(f"💾 Memory loaded. Remember {count} past topics. Last 3: {last_3}")
+                
             except Exception as e:
                 logger.error(f"State load error: {e}")
     
     def save(self):
-        # Атомарное сохранение (защита от краша во время записи)
         fd, tmp_path = tempfile.mkstemp(dir=CACHE_DIR, suffix='.json')
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -123,16 +137,14 @@ class State:
         return uid in self.data["posted_ids"]
     
     def mark_posted(self, uid, title):
-        # Чистка старых ID
         if len(self.data["posted_ids"]) > MAX_POSTED_IDS:
             sorted_ids = sorted(self.data["posted_ids"].items(), key=lambda x: x[1])
             self.data["posted_ids"] = dict(sorted_ids[-POSTED_IDS_TRIM_TO:])
         
         self.data["posted_ids"][uid] = int(time.time())
         
-        # Чистка старых заголовков
         self.data["recent_titles"].append(title)
-        if len(self.data["recent_titles"]) > 40:
+        if len(self.data["recent_titles"]) > 40: # Помним последние 40 тем
             self.data["recent_titles"] = self.data["recent_titles"][-40:]
         
         self.save()
@@ -157,36 +169,39 @@ def split_text(text, max_len=4090):
         if len(text) <= max_len:
             chunks.append(text)
             break
-        # Ищем ближайший перенос строки или пробел
         split_idx = text.rfind('\n', 0, max_len)
         if split_idx == -1: split_idx = text.rfind(' ', 0, max_len)
         if split_idx == -1: split_idx = max_len
-        
         chunks.append(text[:split_idx])
         text = text[split_idx:].strip()
     return chunks
 
-# ============ DUPLICATE CHECK ============
+# ============ DUPLICATE CHECK (PARANOID MODE) ============
 
 async def check_duplicate_topic(new_title):
     history = state.get_recent_titles_str()
     if not history: return False
 
-    prompt = f"""Ниже последние новости канала:
+    # Промпт "Параноик"
+    prompt = f"""У меня есть список уже опубликованных новостей:
 {history}
 
 Новая новость: "{new_title}"
-Вопрос: Это та же самая новость/инцидент, что и одна из прошлых?
-Ответь YES или NO."""
+
+Задача: Проверь, не писали ли мы об этом ранее.
+Если тема хоть немного совпадает (например, "взлом наушников" и "уязвимость Bluetooth") - ответь YES.
+Если это абсолютно новая тема - ответь NO.
+Будь строгим, лучше перебдеть. YES или NO?"""
 
     try:
         resp = await asyncio.to_thread(lambda: openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0, max_tokens=5
+            temperature=0.1, # Почти ноль, чтобы не фантазировал
+            max_tokens=5
         ))
         is_dup = "YES" in resp.choices[0].message.content.strip().upper()
-        if is_dup: logger.info(f"🚫 Duplicate detected: {new_title}")
+        if is_dup: logger.info(f"🚫 Duplicate detected (GPT): {new_title}")
         return is_dup
     except: return False
 
@@ -263,7 +278,6 @@ async def fetch_single_youtube(channel, session):
             uid = f"yt_{vid}"
             if state.is_posted(uid): continue
             
-            # Транскрипт (синхронный, в потоке)
             try:
                 transcript = await asyncio.to_thread(lambda: 
                     YouTubeTranscriptApi.list_transcripts(vid).find_transcript(['ru', 'en']).fetch()
@@ -284,17 +298,18 @@ async def generate_post_content(item):
     if item.type == 'video':
         prompt = "Ты автор канала. Сделай краткий разбор видео (Squeeze). Без воды. Структура: Заголовок, Проблема, Решение."
     else:
+        # ПРОМПТ С ТРЕБОВАНИЕМ ДЕТАЛЕЙ
         prompt = """Ты ведущий аналитик кибербезопасности. Напиши пост для канала.
-Правила:
-1. Если новость короткая - РАСШИРЬ её техническими деталями.
-2. Давай конкретные инструкции (что нажать, что удалить).
-3. Без банальностей "будьте бдительны".
-4. Если новость про бизнес/отчеты - SKIP.
 
-Структура:
-🔥 [Цепляющий заголовок]
-[Суть и детали]
-👇 ЧТО ДЕЛАТЬ:
+ТРЕБОВАНИЯ:
+1. Если новость короткая — ДОПИШИ технические подробности от себя. Пост должен быть полным.
+2. Никаких "будьте бдительны". Только факты и инструкции.
+3. Если тема — "очередной отчет" или "назначение директора" — верни SKIP.
+
+СТРУКТУРА:
+🔥 [Заголовок]
+[Суть проблемы + Технические детали (как это работает)]
+👇 ИНСТРУКЦИЯ ПО ЗАЩИТЕ:
 • [Совет 1]
 • [Совет 2]"""
 
@@ -319,7 +334,6 @@ async def generate_post_content(item):
 async def main():
     logger.info("🚀 Starting scan...")
     async with aiohttp.ClientSession() as session:
-        # Параллельный запуск всех задач
         tasks = [fetch_rss_feed(s, session) for s in RSS_SOURCES] + \
                 [fetch_single_youtube(c, session) for c in YOUTUBE_CHANNELS]
         
@@ -330,8 +344,16 @@ async def main():
         random.shuffle(all_items)
         
         for item in all_items:
+            # 1. СТОП-СЛОВА (МОМЕНТАЛЬНЫЙ БАН)
+            low_title = item.title.lower()
+            if any(bad in low_title for bad in STOP_WORDS):
+                logger.info(f"🚫 BANNED WORD detected: {item.title}")
+                state.mark_posted(item.uid, item.title)
+                continue
+
             logger.info(f"🔍 Analyzing: {item.title}")
             
+            # 2. GPT ПРОВЕРКА НА ПОВТОРЫ
             if await check_duplicate_topic(item.title):
                 state.mark_posted(item.uid, item.title)
                 continue
