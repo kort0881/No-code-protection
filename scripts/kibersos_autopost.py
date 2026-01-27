@@ -10,7 +10,6 @@ import urllib.parse
 import tempfile
 import shutil
 import logging
-from datetime import datetime
 from dataclasses import dataclass
 from typing import Literal
 
@@ -21,7 +20,7 @@ from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import FSInputFile
-from openai import OpenAI
+import google.generativeai as genai
 
 # ============ ЛОГИРОВАНИЕ ============
 
@@ -41,53 +40,46 @@ def get_env(name: str) -> str:
         exit(1)
     return val
 
-OPENAI_API_KEY = get_env("OPENAI_API_KEY")
+# Теперь используем Gemini вместо OpenAI
+GEMINI_API_KEY = get_env("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = get_env("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = get_env("CHANNEL_ID")
 
 CACHE_DIR = os.getenv("CACHE_DIR", "cache_sec")
 os.makedirs(CACHE_DIR, exist_ok=True)
-STATE_FILE = os.path.join(CACHE_DIR, "state_smart_v3.json")
+STATE_FILE = os.path.join(CACHE_DIR, "state_gemini_v1.json")
 
 # Лимиты
-TELEGRAM_CAPTION_LIMIT = 1024
-TELEGRAM_MESSAGE_LIMIT = 4096
 TEXT_ONLY_THRESHOLD = 850
 MAX_POSTED_IDS = 400
-POSTED_IDS_TRIM_TO = 300
 
 # Таймауты
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=25)
 IMAGE_TIMEOUT = aiohttp.ClientTimeout(total=40)
 
-# ⛔️ ЧЕРНЫЙ СПИСОК (СТОП-СЛОВА)
-# Если это есть в заголовке - в мусорку сразу.
+# Стоп-слова
 STOP_WORDS = [
-    # Скучные темы
     "наушник", "jbl", "bluetooth", "гарнитур",
     "квартальный отчет", "назначен директором", "маркетинг", "конференция",
-    # Гос-софт и скучные релизы
     "мвсфера", "мсвсфера", "astra linux", "астра линукс", "red os", "ред ос",
-    "роса хром", "импортозамещ", "реестр по", "гостех", 
+    "роса хром", "импортозамещ", "реестр по", "гостех",
     "обновил логотип", "презентовал новую версию"
 ]
 
 # ============ ИСТОЧНИКИ ============
 
 RSS_SOURCES = [
-    {"name": "Kaspersky Daily", "url": "https://www.kaspersky.ru/blog/feed/", "type": "rss"},
-    {"name": "Kod.ru", "url": "https://kod.ru/rss/", "type": "rss"},
-    {"name": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/", "type": "rss"},
-    {"name": "3DNews Soft", "url": "https://3dnews.ru/software/rss/", "type": "rss"},
-    {"name": "Habr Security", "url": "https://habr.com/ru/rss/hub/infosecurity/all/?fl=ru", "type": "rss"},
-    {"name": "SecurityLab", "url": "https://www.securitylab.ru/rss/news/", "type": "rss"},
+    {"name": "Kaspersky Daily", "url": "https://www.kaspersky.ru/blog/feed/"},
+    {"name": "Kod.ru", "url": "https://kod.ru/rss/"},
+    {"name": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/"},
+    {"name": "Habr Security", "url": "https://habr.com/ru/rss/hub/infosecurity/all/?fl=ru"},
+    {"name": "SecurityLab", "url": "https://www.securitylab.ru/rss/news/"},
 ]
 
 YOUTUBE_CHANNELS = [
     {"name": "Overbafer1", "id": "UC-lHJ97lqoOGgsLFuQ8Y8_g"},
     {"name": "NetworkChuck", "id": "UC9x0AN7BWHpXyPic4IQC74Q"},
     {"name": "The Hated One", "id": "UCjr2bPAyPV7t35mVihRBCzw"},
-    {"name": "NN", "id": "UCfJkM0E6qT8j6w6q5x5x_9A"},
 ]
 
 @dataclass
@@ -102,9 +94,12 @@ class NewsItem:
 # ============ INIT ============
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ============ STATE MANAGEMENT ============
+# Настройка Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+
+# ============ STATE ============
 
 class State:
     def __init__(self):
@@ -116,14 +111,10 @@ class State:
             try:
                 with open(STATE_FILE, "r", encoding="utf-8") as f:
                     self.data.update(json.load(f))
-                    if "recent_titles" not in self.data: self.data["recent_titles"] = []
-                
-                # Логируем память
-                count = len(self.data["recent_titles"])
-                logger.info(f"💾 Memory loaded. Remember {count} past topics.")
-                
-            except Exception as e:
-                logger.error(f"State load error: {e}")
+                    if "recent_titles" not in self.data:
+                        self.data["recent_titles"] = []
+                logger.info(f"💾 Memory: {len(self.data['recent_titles'])} topics")
+            except: pass
     
     def save(self):
         fd, tmp_path = tempfile.mkstemp(dir=CACHE_DIR, suffix='.json')
@@ -132,7 +123,7 @@ class State:
                 json.dump(self.data, f, indent=2, ensure_ascii=False)
             shutil.move(tmp_path, STATE_FILE)
         except Exception as e:
-            logger.error(f"State save error: {e}")
+            logger.error(f"Save error: {e}")
             if os.path.exists(tmp_path): os.unlink(tmp_path)
     
     def is_posted(self, uid):
@@ -141,22 +132,20 @@ class State:
     def mark_posted(self, uid, title):
         if len(self.data["posted_ids"]) > MAX_POSTED_IDS:
             sorted_ids = sorted(self.data["posted_ids"].items(), key=lambda x: x[1])
-            self.data["posted_ids"] = dict(sorted_ids[-POSTED_IDS_TRIM_TO:])
+            self.data["posted_ids"] = dict(sorted_ids[-300:])
         
         self.data["posted_ids"][uid] = int(time.time())
-        
         self.data["recent_titles"].append(title)
         if len(self.data["recent_titles"]) > 40:
             self.data["recent_titles"] = self.data["recent_titles"][-40:]
-        
         self.save()
 
-    def get_recent_titles_str(self):
-        return "\n".join(f"- {t}" for t in self.data["recent_titles"])
+    def get_recent_titles(self):
+        return self.data["recent_titles"]
 
 state = State()
 
-# ============ TEXT UTILS ============
+# ============ UTILS ============
 
 def clean_text(text):
     if not text: return ""
@@ -164,64 +153,93 @@ def clean_text(text):
     text = re.sub(r'\s+', ' ', text)
     return html.unescape(text).strip()
 
-def split_text(text, max_len=4090):
-    if len(text) <= max_len: return [text]
-    chunks = []
-    while text:
-        if len(text) <= max_len:
-            chunks.append(text)
-            break
-        split_idx = text.rfind('\n', 0, max_len)
-        if split_idx == -1: split_idx = text.rfind(' ', 0, max_len)
-        if split_idx == -1: split_idx = max_len
-        chunks.append(text[:split_idx])
-        text = text[split_idx:].strip()
-    return chunks
+# ============ GEMINI FUNCTIONS ============
 
-# ============ DUPLICATE CHECK (PARANOID MODE) ============
-
-async def check_duplicate_topic(new_title):
-    history = state.get_recent_titles_str()
-    if not history: return False
-
-    prompt = f"""У меня есть список последних тем:
+async def check_duplicate_gemini(new_title):
+    """Проверка дублей через Gemini"""
+    recent = state.get_recent_titles()
+    if not recent:
+        return False
+    
+    history = "\n".join(f"- {t}" for t in recent[-20:])
+    
+    prompt = f"""Список последних тем канала:
 {history}
 
 Новая тема: "{new_title}"
 
-Вопрос: Это повтор? 
-Ответь YES, если мы уже писали про этот инцидент или устройство (например, опять про JBL или тот же вирус).
-Ответь NO, если это свежак."""
+Это дубликат или очень похожая тема? Ответь ТОЛЬКО одним словом: YES или NO"""
 
     try:
-        resp = await asyncio.to_thread(lambda: openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1, max_tokens=5
-        ))
-        is_dup = "YES" in resp.choices[0].message.content.strip().upper()
-        if is_dup: logger.info(f"🚫 Duplicate detected (GPT): {new_title}")
+        response = await asyncio.to_thread(
+            lambda: gemini_model.generate_content(prompt)
+        )
+        answer = response.text.strip().upper()
+        is_dup = "YES" in answer
+        if is_dup:
+            logger.info(f"🚫 Duplicate: {new_title}")
         return is_dup
-    except: return False
+    except Exception as e:
+        logger.warning(f"Gemini check error: {e}")
+        return False
+
+async def generate_post_gemini(item):
+    """Генерация поста через Gemini"""
+    
+    prompt = f"""Ты редактор канала про кибербезопасность для обычных людей.
+
+ПРАВИЛА:
+1. Если новость про: госсофт (Астра, МСВСфера), корпоративные отчеты, назначения директоров, конференции — ответь SKIP
+2. Если новость про: взломы телефонов, мошенников, утечки данных, VPN — напиши пост
+
+СТИЛЬ: Как друг рассказывает другу. Без официоза.
+
+СТРУКТУРА:
+🔥 [Цепляющий заголовок]
+
+[Суть проблемы простым языком]
+
+👇 ЧТО ДЕЛАТЬ:
+• [Совет 1]
+• [Совет 2]
+
+---
+Заголовок новости: {item.title}
+Текст: {item.text[:3000]}
+---
+
+Напиши пост или ответь SKIP:"""
+
+    try:
+        response = await asyncio.to_thread(
+            lambda: gemini_model.generate_content(prompt)
+        )
+        text = response.text.strip()
+        
+        if "SKIP" in text or len(text) < 50:
+            logger.info(f"⏩ Skipped: {item.title}")
+            return None
+        
+        return text + f"\n\n🔗 <a href='{item.link}'>Источник</a>"
+    except Exception as e:
+        logger.error(f"Gemini error: {e}")
+        return None
 
 # ============ IMAGES ============
 
-def generate_prompt(title):
-    styles = [
-        "dark cyberpunk city atmosphere, neon rain, cinematic lighting, 8k",
-        "abstract data flow visualization, matrix style, green and black code",
-        "minimalist glitch art, distorted reality, tech noir aesthetic",
-        "isometric server room, stylized 3d render, soft blue lighting",
-        "detailed blueprint schematic, white lines on dark blue background"
-    ]
-    obj = ["digital anomaly", "broken smartphone screen", "anonymous hacker", "red warning hologram"]
-    
-    clean_t = re.sub(r'[^a-zA-Z0-9\s]', '', title)[:40]
-    return f"{random.choice(obj)}, {clean_t}, {random.choice(styles)}"
-
 async def generate_image(title, session):
     try:
-        prompt = generate_prompt(title)
+        styles = [
+            "dark cyberpunk, neon rain, cinematic",
+            "matrix style, green code on black",
+            "glitch art, tech noir aesthetic",
+            "isometric 3d render, soft blue lighting"
+        ]
+        objects = ["digital anomaly", "hacker silhouette", "broken screen", "warning hologram"]
+        
+        clean_t = re.sub(r'[^a-zA-Z0-9\s]', '', title)[:40]
+        prompt = f"{random.choice(objects)}, {clean_t}, {random.choice(styles)}"
+        
         encoded = urllib.parse.quote(prompt)
         seed = random.randint(0, 99999)
         url = f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=720&nologo=true&seed={seed}"
@@ -231,160 +249,125 @@ async def generate_image(title, session):
                 data = await resp.read()
                 if len(data) > 1000:
                     path = os.path.join(CACHE_DIR, f"img_{int(time.time())}.jpg")
-                    with open(path, "wb") as f: f.write(data)
+                    with open(path, "wb") as f:
+                        f.write(data)
                     return path
     except Exception as e:
-        logger.warning(f"Image gen failed: {e}")
+        logger.warning(f"Image error: {e}")
     return None
 
 # ============ FETCHERS ============
 
-async def fetch_rss_feed(source, session):
+async def fetch_rss(source, session):
     items = []
     try:
         async with session.get(source['url'], timeout=HTTP_TIMEOUT) as resp:
-            if resp.status != 200: return []
+            if resp.status != 200:
+                return []
             text = await resp.text()
-            
+        
         feed = feedparser.parse(text)
         for entry in feed.entries[:3]:
             link = entry.get('link')
-            if not link: continue
+            if not link:
+                continue
             
             uid = hashlib.md5(link.encode()).hexdigest()
-            if state.is_posted(uid): continue
+            if state.is_posted(uid):
+                continue
             
             items.append(NewsItem(
-                type="news", title=entry.get('title', ''), 
+                type="news",
+                title=entry.get('title', ''),
                 text=clean_text(entry.get("summary", "")),
-                link=link, source=source['name'], uid=uid
+                link=link,
+                source=source['name'],
+                uid=uid
             ))
     except Exception as e:
         logger.warning(f"RSS error {source['name']}: {e}")
     return items
 
-async def fetch_single_youtube(channel, session):
+async def fetch_youtube(channel, session):
     items = []
     try:
         url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel['id']}"
         async with session.get(url, timeout=HTTP_TIMEOUT) as resp:
-            if resp.status != 200: return []
+            if resp.status != 200:
+                return []
             text = await resp.text()
-            
+        
         feed = feedparser.parse(text)
         for entry in feed.entries[:2]:
             vid = entry.get('yt_videoid')
             uid = f"yt_{vid}"
-            if state.is_posted(uid): continue
+            if state.is_posted(uid):
+                continue
             
             try:
-                transcript = await asyncio.to_thread(lambda: 
-                    YouTubeTranscriptApi.list_transcripts(vid).find_transcript(['ru', 'en']).fetch()
+                transcript = await asyncio.to_thread(
+                    lambda: YouTubeTranscriptApi.list_transcripts(vid)
+                    .find_transcript(['ru', 'en']).fetch()
                 )
                 full_text = " ".join([t['text'] for t in transcript])
                 items.append(NewsItem(
-                    type="video", title=entry.title, text=full_text[:5000],
-                    link=entry.link, source=f"YouTube {channel['name']}", uid=uid
+                    type="video",
+                    title=entry.title,
+                    text=full_text[:5000],
+                    link=entry.link,
+                    source=f"YouTube {channel['name']}",
+                    uid=uid
                 ))
-            except: pass
+            except:
+                pass
     except Exception as e:
         logger.warning(f"YT error {channel['name']}: {e}")
     return items
 
-# ============ GPT & POST ============
-
-async def generate_post_content(item):
-    # УЛУЧШЕННЫЙ ФИЛЬТР "АНТИ-СКУКА"
-    
-    system_prompt = """Ты — редактор техно-канала.
-Твоя задача — отфильтровать мусор и написать полезный пост.
-
-⛔️ ЖЕСТКИЙ ФИЛЬТР (SKIP):
-Если новость про:
-1. Выход новой версии "Astra Linux", "МСВСфера", "РедОС" (или любой другой никому не нужной ОС).
-2. Скучные корпоративные отчеты, конференции, назначения директоров.
-3. Пресс-релизы компаний ("Мы выпустили...", "Мы обновили логотип").
-4. "Импортозамещение" ради галочки.
--> ВЕРНИ ТОЛЬКО СЛОВО: SKIP
-
-✅ ЧТО ПИСАТЬ:
-Только то, что касается ОБЫЧНЫХ людей:
-- Взломы Android/iPhone.
-- Утечки паролей, данных карт.
-- Новые схемы мошенников в Telegram/WhatsApp.
-- Опасные VPN или Wi-Fi.
-
-СТИЛЬ:
-Без официоза. Как друг рассказывает другу.
-Если новость короткая — ДОПИШИ детали сам (почему это опасно, как работает).
-
-СТРУКТУРА:
-🔥 [Заголовок]
-[Суть проблемы]
-👇 ЧТО ДЕЛАТЬ:
-• [Совет 1]
-• [Совет 2]"""
-
-    try:
-        resp = await asyncio.to_thread(lambda: openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Title: {item.title}\nText: {item.text}"}
-            ],
-            max_tokens=2000
-        ))
-        text = resp.choices[0].message.content.strip()
-        if "SKIP" in text or len(text) < 50: 
-            logger.info(f"⏩ Skipped by GPT (Boring topic): {item.title}")
-            return None
-        return text + f"\n\n🔗 <a href='{item.link}'>Источник</a>"
-    except Exception as e:
-        logger.error(f"GPT error: {e}")
-        return None
-
-# ============ MAIN LOOP ============
+# ============ MAIN ============
 
 async def main():
-    logger.info("🚀 Starting scan...")
+    logger.info("🚀 Starting (Gemini FREE mode)...")
+    
     async with aiohttp.ClientSession() as session:
-        tasks = [fetch_rss_feed(s, session) for s in RSS_SOURCES] + \
-                [fetch_single_youtube(c, session) for c in YOUTUBE_CHANNELS]
+        # Сбор данных
+        tasks = [fetch_rss(s, session) for s in RSS_SOURCES]
+        tasks += [fetch_youtube(c, session) for c in YOUTUBE_CHANNELS]
         
         results = await asyncio.gather(*tasks)
         all_items = [item for sublist in results for item in sublist]
         
-        logger.info(f"📦 Found {len(all_items)} raw items")
+        logger.info(f"📦 Found {len(all_items)} items")
         random.shuffle(all_items)
         
         for item in all_items:
-            # 1. СТОП-СЛОВА
+            # 1. Стоп-слова
             low_title = item.title.lower()
             if any(bad in low_title for bad in STOP_WORDS):
-                logger.info(f"🚫 BANNED WORD detected: {item.title}")
-                state.mark_posted(item.uid, item.title)
-                continue
-
-            logger.info(f"🔍 Analyzing: {item.title}")
-            
-            # 2. ПРОВЕРКА ДУБЛЕЙ
-            if await check_duplicate_topic(item.title):
+                logger.info(f"🚫 Banned word: {item.title}")
                 state.mark_posted(item.uid, item.title)
                 continue
             
-            post_text = await generate_post_content(item)
+            logger.info(f"🔍 Checking: {item.title}")
+            
+            # 2. Проверка дублей
+            if await check_duplicate_gemini(item.title):
+                state.mark_posted(item.uid, item.title)
+                continue
+            
+            # 3. Генерация поста
+            post_text = await generate_post_gemini(item)
             if not post_text:
-                # Если GPT сказал SKIP (скучная новость) — запоминаем, чтобы не проверять снова
                 state.mark_posted(item.uid, item.title)
                 continue
             
-            # Постинг
+            # 4. Отправка
             try:
                 if len(post_text) > TEXT_ONLY_THRESHOLD:
-                    logger.info("📜 Long read -> Text only")
-                    await bot.send_message(CHANNEL_ID, text=post_text, disable_web_page_preview=False)
+                    logger.info("📜 Text only")
+                    await bot.send_message(CHANNEL_ID, text=post_text)
                 else:
-                    logger.info("📸 Short read -> Image + Text")
+                    logger.info("📸 With image")
                     img = await generate_image(item.title, session)
                     if img:
                         await bot.send_photo(CHANNEL_ID, photo=FSInputFile(img), caption=post_text)
@@ -392,12 +375,13 @@ async def main():
                     else:
                         await bot.send_message(CHANNEL_ID, text=post_text)
                 
-                logger.info("✅ Success!")
+                logger.info("✅ Posted!")
                 state.mark_posted(item.uid, item.title)
-                break 
+                break
+                
             except Exception as e:
                 logger.error(f"Telegram error: {e}")
-
+    
     await bot.session.close()
 
 if __name__ == "__main__":
