@@ -38,6 +38,7 @@ jobs:
           CACHE_DIR: cache_sec
         run: python scripts/kibersos_autopost.py
       
+      # СОХРАНЕНИЕ КЭША — ВАЖНО!
       - name: Commit state
         run: |
           git config --local user.email "action@github.com"
