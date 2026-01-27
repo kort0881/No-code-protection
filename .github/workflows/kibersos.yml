@@ -2,7 +2,11 @@ name: KIBER SOS Autopost
 
 on:
   schedule:
-    - cron: '0 */4 * * *'
+    # 06:00 UTC = 09:00 МСК
+    # 12:00 UTC = 15:00 МСК
+    # 15:00 UTC = 18:00 МСК
+    # 18:00 UTC = 21:00 МСК
+    - cron: '0 6,12,15,18 * * *'
   workflow_dispatch:
 
 permissions:
