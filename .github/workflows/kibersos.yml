@@ -2,7 +2,6 @@ name: KIBER SOS Autopost
 
 on:
   schedule:
-    # Запуск каждые 4 часа
     - cron: '0 */4 * * *'
   workflow_dispatch:
 
@@ -29,7 +28,7 @@ jobs:
       
       - name: Run KIBER SOS autopost
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           CACHE_DIR: cache_sec
