@@ -20,7 +20,7 @@ from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import FSInputFile
-import google.generativeai as genai
+from google import genai
 
 # ============ ЛОГИРОВАНИЕ ============
 
@@ -40,14 +40,13 @@ def get_env(name: str) -> str:
         exit(1)
     return val
 
-# Теперь используем Gemini вместо OpenAI
 GEMINI_API_KEY = get_env("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = get_env("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = get_env("CHANNEL_ID")
 
 CACHE_DIR = os.getenv("CACHE_DIR", "cache_sec")
 os.makedirs(CACHE_DIR, exist_ok=True)
-STATE_FILE = os.path.join(CACHE_DIR, "state_gemini_v1.json")
+STATE_FILE = os.path.join(CACHE_DIR, "state_gemini_v2.json")
 
 # Лимиты
 TEXT_ONLY_THRESHOLD = 850
@@ -63,7 +62,8 @@ STOP_WORDS = [
     "квартальный отчет", "назначен директором", "маркетинг", "конференция",
     "мвсфера", "мсвсфера", "astra linux", "астра линукс", "red os", "ред ос",
     "роса хром", "импортозамещ", "реестр по", "гостех",
-    "обновил логотип", "презентовал новую версию"
+    "обновил логотип", "презентовал новую версию",
+    "postgresql", "highload", "go,", "golang"
 ]
 
 # ============ ИСТОЧНИКИ ============
@@ -95,9 +95,8 @@ class NewsItem:
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
-# Настройка Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+# Новый клиент Gemini
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ============ STATE ============
 
@@ -114,7 +113,8 @@ class State:
                     if "recent_titles" not in self.data:
                         self.data["recent_titles"] = []
                 logger.info(f"💾 Memory: {len(self.data['recent_titles'])} topics")
-            except: pass
+            except:
+                pass
     
     def save(self):
         fd, tmp_path = tempfile.mkstemp(dir=CACHE_DIR, suffix='.json')
@@ -124,7 +124,8 @@ class State:
             shutil.move(tmp_path, STATE_FILE)
         except Exception as e:
             logger.error(f"Save error: {e}")
-            if os.path.exists(tmp_path): os.unlink(tmp_path)
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
     
     def is_posted(self, uid):
         return uid in self.data["posted_ids"]
@@ -148,12 +149,27 @@ state = State()
 # ============ UTILS ============
 
 def clean_text(text):
-    if not text: return ""
+    if not text:
+        return ""
     text = re.sub(r'<[^>]+>', ' ', text)
     text = re.sub(r'\s+', ' ', text)
     return html.unescape(text).strip()
 
 # ============ GEMINI FUNCTIONS ============
+
+async def call_gemini(prompt: str) -> str:
+    """Вызов Gemini API с новой библиотекой"""
+    try:
+        response = await asyncio.to_thread(
+            lambda: gemini_client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=prompt
+            )
+        )
+        return response.text.strip()
+    except Exception as e:
+        logger.error(f"Gemini API error: {e}")
+        return ""
 
 async def check_duplicate_gemini(new_title):
     """Проверка дублей через Gemini"""
@@ -170,18 +186,11 @@ async def check_duplicate_gemini(new_title):
 
 Это дубликат или очень похожая тема? Ответь ТОЛЬКО одним словом: YES или NO"""
 
-    try:
-        response = await asyncio.to_thread(
-            lambda: gemini_model.generate_content(prompt)
-        )
-        answer = response.text.strip().upper()
-        is_dup = "YES" in answer
-        if is_dup:
-            logger.info(f"🚫 Duplicate: {new_title}")
-        return is_dup
-    except Exception as e:
-        logger.warning(f"Gemini check error: {e}")
-        return False
+    answer = await call_gemini(prompt)
+    is_dup = "YES" in answer.upper()
+    if is_dup:
+        logger.info(f"🚫 Duplicate: {new_title}")
+    return is_dup
 
 async def generate_post_gemini(item):
     """Генерация поста через Gemini"""
@@ -189,8 +198,8 @@ async def generate_post_gemini(item):
     prompt = f"""Ты редактор канала про кибербезопасность для обычных людей.
 
 ПРАВИЛА:
-1. Если новость про: госсофт (Астра, МСВСфера), корпоративные отчеты, назначения директоров, конференции — ответь SKIP
-2. Если новость про: взломы телефонов, мошенников, утечки данных, VPN — напиши пост
+1. Если новость про: госсофт (Астра, МСВСфера), корпоративные отчеты, назначения директоров, конференции, криптовалюту, казино — ответь SKIP
+2. Если новость про: взломы телефонов, мошенников, утечки данных, VPN, безопасность Android/iPhone — напиши пост
 
 СТИЛЬ: Как друг рассказывает другу. Без официоза.
 
@@ -210,20 +219,13 @@ async def generate_post_gemini(item):
 
 Напиши пост или ответь SKIP:"""
 
-    try:
-        response = await asyncio.to_thread(
-            lambda: gemini_model.generate_content(prompt)
-        )
-        text = response.text.strip()
-        
-        if "SKIP" in text or len(text) < 50:
-            logger.info(f"⏩ Skipped: {item.title}")
-            return None
-        
-        return text + f"\n\n🔗 <a href='{item.link}'>Источник</a>"
-    except Exception as e:
-        logger.error(f"Gemini error: {e}")
+    text = await call_gemini(prompt)
+    
+    if not text or "SKIP" in text.upper() or len(text) < 50:
+        logger.info(f"⏩ Skipped: {item.title}")
         return None
+    
+    return text + f"\n\n🔗 <a href='{item.link}'>Источник</a>"
 
 # ============ IMAGES ============
 
@@ -327,7 +329,7 @@ async def fetch_youtube(channel, session):
 # ============ MAIN ============
 
 async def main():
-    logger.info("🚀 Starting (Gemini FREE mode)...")
+    logger.info("🚀 Starting (Gemini 2.0 FREE mode)...")
     
     async with aiohttp.ClientSession() as session:
         # Сбор данных
