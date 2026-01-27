@@ -1,5 +1,5 @@
 aiogram
-openai
+google-generativeai
 aiohttp
 feedparser
 youtube-transcript-api
