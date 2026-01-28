@@ -49,31 +49,28 @@ CACHE_DIR = os.getenv("CACHE_DIR", "cache_sec")
 os.makedirs(CACHE_DIR, exist_ok=True)
 STATE_FILE = os.path.join(CACHE_DIR, "state_groq_v2.json")
 
-# Настройки контента
-TEXT_ONLY_THRESHOLD = 700  # Если текст длиннее, картинку НЕ делаем
+TEXT_ONLY_THRESHOLD = 700
 MAX_POSTED_IDS = 400
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=25)
 IMAGE_TIMEOUT = aiohttp.ClientTimeout(total=40)
 
-# ============ GROQ ЛИМИТЫ (БЮДЖЕТ) ============
+# ============ ОБНОВЛЕННЫЕ МОДЕЛИ ============
 
 @dataclass
 class ModelConfig:
     name: str
-    rpm: int  # requests per minute
-    tpm: int  # tokens per minute
+    rpm: int
+    tpm: int
     daily_tokens: int
     priority: int
 
 MODELS = {
     "heavy": ModelConfig("llama-3.3-70b-versatile", rpm=30, tpm=6000, daily_tokens=100000, priority=1),
-    "light": ModelConfig("llama3-8b-8192", rpm=30, tpm=30000, daily_tokens=500000, priority=2),
-    "fallback": ModelConfig("llama-3.1-8b-instant", rpm=30, tpm=20000, daily_tokens=500000, priority=3),
+    "light": ModelConfig("llama-3.1-8b-instant", rpm=30, tpm=20000, daily_tokens=500000, priority=2),
+    "fallback": ModelConfig("mixtral-8x7b-32768", rpm=30, tpm=5000, daily_tokens=100000, priority=3),
 }
 
 class GroqBudget:
-    """Умное отслеживание лимитов Groq"""
-    
     def __init__(self):
         self.state_file = os.path.join(CACHE_DIR, "groq_budget.json")
         self.data = self._load()
@@ -111,19 +108,17 @@ class GroqBudget:
         if model_key not in MODELS: return False
         cfg = MODELS[model_key]
         used = self.data["daily_tokens"].get(cfg.name, 0)
-        return (cfg.daily_tokens - used) > (cfg.daily_tokens * 0.05) # 5% резерв
+        return (cfg.daily_tokens - used) > (cfg.daily_tokens * 0.05)
     
     async def wait_for_rate_limit(self, model_key: str):
         cfg = MODELS[model_key]
         model = cfg.name
         now = time.time()
         
-        # Сброс минутного окна
         if now - self.data["minute_start"].get(model, 0) > 60:
             self.data["minute_start"][model] = now
             self.data["request_count"][model] = 0
         
-        # Проверка RPM
         if self.data["request_count"].get(model, 0) >= cfg.rpm - 2:
             wait = 60 - (now - self.data["minute_start"][model]) + 1
             logger.info(f"⏳ Лимит RPM ({model_key}). Ждем {wait:.1f}с")
@@ -131,7 +126,6 @@ class GroqBudget:
             self.data["minute_start"][model] = time.time()
             self.data["request_count"][model] = 0
             
-        # Минимальный интервал (анти-спам)
         last = self.data["last_request_time"].get(model, 0)
         if now - last < 2: await asyncio.sleep(2)
         
@@ -140,41 +134,86 @@ class GroqBudget:
 
 budget = GroqBudget()
 
-# ============ ФИЛЬТРЫ ============
+# ============ ФИЛЬТРЫ (ОБНОВЛЕНЫ ДЛЯ АНГЛИЙСКОГО) ============
 
+# Теперь стоп-слова на английском (источники английские)
 STOP_WORDS = [
-    "наушник", "jbl", "bluetooth", "гарнитур",
-    "квартальный отчет", "назначен директором", "маркетинг", "конференция",
-    "мвсфера", "мсвсфера", "astra linux", "астра линукс", "red os", "ред ос",
-    "импортозамещ", "postgresql", "highload", "golang", "криптовалют", "казино"
+    "headphone", "jbl", "bluetooth headset", "earbuds",
+    "quarterly earnings", "appointed ceo", "marketing campaign", "conference announcement",
+    "cryptocurrency", "casino", "gambling", "nft trading", "bitcoin price"
 ]
 
+# Банальные фразы на РУССКОМ (для проверки сгенерированного поста)
 BANNED_PHRASES = [
     "из доверенных источников", "регулярно обновляйте", "будьте бдительны",
     "внимательно читайте", "используйте антивирус", "надёжный пароль",
-    "не переходите по ссылкам"
+    "не переходите по ссылкам", "будьте осторожны", "проверяйте ссылки",
+    "установите обновления", "используйте двухфакторную", "сложные пароли",
+    "надежные решения", "системы обнаружения", "мониторинг трафика",
+    "обеспечения безопасности", "защитить свои данные", "потенциальных атак",
+    "устранять уязвимости", "злоумышленниками для атак"
+]
+
+# Технические термины (на английском и русском — для проверки обоих)
+TECH_INDICATORS = [
+    "cve-", "0day", "exploit", "payload", "shell", "sudo", "root",
+    "port ", "ip", "dns", "ssh", "rdp", "smb", "http", "api",
+    "token", "hash", "salt", "aes", "rsa", "tls", "ssl",
+    "android", "ios", "windows", "linux", "macos",
+    "chrome", "firefox", "safari", "edge",
+    "apt", "lazarus", "fancy bear", "sandworm", "apt28", "apt29",
+    ".exe", ".dll", ".apk", ".sh", ".bat", ".js",
+    "phishing", "malware", "ransomware", "backdoor", "trojan",
+    # Русские варианты
+    "порт ", "вредонос", "эксплойт", "уязвимост", "фишинг"
 ]
 
 def is_too_generic(text: str) -> bool:
-    """Если пост состоит из банальностей — выкидываем"""
+    """Проверка сгенерированного РУССКОГО поста на банальности"""
     text_lower = text.lower()
-    count = sum(1 for phrase in BANNED_PHRASES if phrase in text_lower)
-    return count >= 2
+    
+    banned_count = sum(1 for phrase in BANNED_PHRASES if phrase in text_lower)
+    if banned_count >= 1:
+        logger.info(f"⚠️ Generic phrase detected: {banned_count} matches")
+        return True
+    
+    tech_count = sum(1 for term in TECH_INDICATORS if term in text_lower)
+    if tech_count < 2:
+        logger.info(f"⚠️ Not enough technical details: {tech_count}/2")
+        return True
+    
+    lines = text.split('\n')
+    advice_lines = [l for l in lines if l.strip().startswith('•') or l.strip().startswith('-')]
+    if len(advice_lines) > 0 and len(advice_lines) / max(len(lines), 1) > 0.4:
+        logger.info(f"⚠️ Too many generic tips: {len(advice_lines)} lines")
+        return True
+    
+    return False
 
 def passes_local_filters(title: str, text: str) -> bool:
-    """Быстрая проверка без AI"""
+    """Фильтрация АНГЛИЙСКОГО исходника"""
     content = (title + " " + text).lower()
     if any(w in content for w in STOP_WORDS):
         logger.info(f"🚫 Stop word found: {title}")
         return False
     if len(text) < 100:
         return False
+    
+    # Требуем наличие security-ключевых слов в английском тексте
+    security_keywords = [
+        "vulnerability", "exploit", "malware", "ransomware", "phishing",
+        "hacker", "breach", "attack", "threat", "zero-day", "patch",
+        "security", "cybersecurity", "cyber attack", "data breach"
+    ]
+    if not any(kw in content for kw in security_keywords):
+        logger.info(f"🚫 No security keywords: {title}")
+        return False
+    
     return True
 
 # ============ GROQ CALLER ============
 
 async def call_groq(prompt: str, model_pref: str = "heavy", max_tokens: int = 1500) -> tuple[str, int]:
-    """Умный вызов с переключением моделей при ошибках"""
     order = ["heavy", "light", "fallback"] if model_pref == "heavy" else ["light", "fallback", "heavy"]
     
     for key in order:
@@ -193,10 +232,11 @@ async def call_groq(prompt: str, model_pref: str = "heavy", max_tokens: int = 15
             res = response.choices[0].message.content.strip()
             tokens = response.usage.total_tokens if response.usage else 0
             budget.add_tokens(cfg.name, tokens)
+            logger.info(f"✅ Model used: {cfg.name} ({tokens} tokens)")
             return res, tokens
             
         except Exception as e:
-            logger.warning(f"⚠️ Error {key}: {e}")
+            logger.warning(f"⚠️ Error {key} ({cfg.name}): {e}")
             await asyncio.sleep(5)
             continue
             
@@ -205,10 +245,8 @@ async def call_groq(prompt: str, model_pref: str = "heavy", max_tokens: int = 15
 # ============ ЛОГИКА ============
 
 async def check_duplicate(new_title: str, recent: list) -> bool:
-    """Сначала проверяем локально (бесплатно), потом AI"""
     if not recent: return False
     
-    # 1. Локальная проверка (SequenceMatcher)
     norm_new = re.sub(r'\W', '', new_title.lower())
     for old in recent[-20:]:
         norm_old = re.sub(r'\W', '', old.lower())
@@ -216,7 +254,6 @@ async def check_duplicate(new_title: str, recent: list) -> bool:
             logger.info(f"🔄 Local duplicate: {new_title}")
             return True
             
-    # 2. AI проверка (легкая модель)
     history = "\n".join(f"- {t}" for t in recent[-10:])
     prompt = f"Темы:\n{history}\n\nНовая: '{new_title}'\nДубликат? YES/NO"
     ans, _ = await call_groq(prompt, "light", 10)
@@ -224,32 +261,59 @@ async def check_duplicate(new_title: str, recent: list) -> bool:
     return "YES" in ans.upper()
 
 async def generate_post(item) -> Optional[str]:
-    prompt = f"""Кибербез-канал. Пиши кратко, с конкретикой.
+    # ПРОМПТ С ПЕРЕВОДОМ (как в первом скрипте)
+    prompt = f"""Ты — редактор русскоязычного Telegram-канала про кибербезопасность (30к+ подписчиков).
 
-НОВОСТЬ: {item.title}
-{item.text[:2000]}
+ИСХОДНАЯ НОВОСТЬ (English):
+Заголовок: {item.title}
+Текст: {item.text[:2500]}
 
-ПРАВИЛА:
-- Без банальностей (пароли, антивирус, "будьте осторожны")
-- Только конкретные угрозы и действия
-- SKIP если нет пользы для обычного юзера
+ТВОЯ ЗАДАЧА:
+1. Прочитай английский текст и переведи суть на РУССКИЙ язык
+2. Напиши пост на РУССКОМ с конкретными рекомендациями
 
-ФОРМАТ:
-🔥 [Заголовок]
+СТРОГИЕ ПРАВИЛА:
+❌ НЕ ПИШИ банальности:
+   - "обновляйте ПО", "антивирус", "будьте осторожны"
+   - "надежные пароли", "системы обнаружения"
+   - "защитить свои данные", "мониторинг трафика"
 
-[2-3 предложения: суть + механика]
+✅ ОБЯЗАТЕЛЬНО укажи:
+   - Конкретные уязвимости (CVE-номера, версии софта)
+   - Технические детали атаки (порты, протоколы, команды)
+   - Специфические действия для защиты (не "обновитесь", а "обновитесь до Chrome 131.0.6778.264")
+
+📌 Если нет технических деталей или польза неясна — пиши SKIP
+
+ФОРМАТ (на РУССКОМ):
+🔥 [Заголовок с конкретикой]
+
+[2-3 предложения: ЧТО произошло + КАК работает атака]
 
 👇 ЧТО СДЕЛАТЬ:
-• [Конкретное действие]
+• [Конкретное действие с версиями/командами/настройками]
+• [Еще одно конкретное действие]
 
-Пост или SKIP:"""
+ПРИМЕРЫ ХОРОШЕГО:
+✅ "Обновите Chrome до версии 131.0.6778.108 (CVE-2024-12345)"
+✅ "Закройте порт 445 (SMB) командой: netsh advfirewall firewall add rule..."
+✅ "Проверьте наличие файла evil.dll в C:\\Windows\\Temp"
 
-    text, _ = await call_groq(prompt, "heavy", 1000)
+ПРИМЕРЫ ПЛОХОГО:
+❌ "Используйте надежные решения для мониторинга"
+❌ "Регулярно обновляйте программное обеспечение"
+❌ "Будьте бдительны при переходе по ссылкам"
+
+Пост на РУССКОМ или SKIP:"""
+
+    text, _ = await call_groq(prompt, "heavy", 1200)
     
-    if not text or "SKIP" in text.upper() or len(text) < 100:
+    if not text or "SKIP" in text.upper() or len(text) < 120:
+        logger.info("⏩ AI returned SKIP or too short")
         return None
+    
     if is_too_generic(text):
-        logger.info(f"⏩ Too generic: {item.title}")
+        logger.info(f"⏩ Post is too generic after generation")
         return None
         
     return text + f"\n\n🔗 <a href='{item.link}'>Источник</a>"
@@ -258,9 +322,9 @@ async def generate_post(item) -> Optional[str]:
 
 async def generate_image(title, session):
     try:
-        styles = ["cyberpunk neon", "matrix code", "glitch art", "isometric 3d"]
+        styles = ["cyberpunk neon red", "matrix green code", "hacker terminal glitch", "dark web aesthetic"]
         clean_t = re.sub(r'[^a-zA-Z0-9\s]', '', title)[:40]
-        prompt = f"hacker silhouette, {clean_t}, {random.choice(styles)}"
+        prompt = f"hacker silhouette keyboard, {clean_t}, {random.choice(styles)}, dark background"
         encoded = urllib.parse.quote(prompt)
         url = f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=720&nologo=true&seed={random.randint(0,99999)}"
         
@@ -270,11 +334,13 @@ async def generate_image(title, session):
                 if len(data) > 5000:
                     path = os.path.join(CACHE_DIR, f"img_{int(time.time())}.jpg")
                     with open(path, "wb") as f: f.write(data)
+                    logger.info(f"   🖼 Image saved: {len(data)} bytes")
                     return path
-    except: pass
+    except Exception as e:
+        logger.warning(f"   ⚠️ Image generation failed: {e}")
     return None
 
-# ============ КЛАССЫ И ИНИЦИАЛИЗАЦИЯ ============
+# ============ КЛАССЫ ============
 
 @dataclass
 class NewsItem:
@@ -288,7 +354,7 @@ class NewsItem:
 bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# ============ STATE (ПАМЯТЬ) ============
+# ============ STATE ============
 
 class State:
     def __init__(self):
@@ -336,11 +402,12 @@ async def fetch_rss(source, session):
             if state.is_posted(uid): continue
             
             title = entry.get('title', '')
-            text = clean_text(entry.get("summary", ""))
+            text = clean_text(entry.get("summary", "") or entry.get("description", ""))
             
             if passes_local_filters(title, text):
                 items.append(NewsItem("news", title, text, link, source['name'], uid))
-    except: pass
+    except Exception as e:
+        logger.warning(f"⚠️ RSS fetch error ({source['name']}): {e}")
     return items
 
 async def fetch_youtube(channel, session):
@@ -356,7 +423,7 @@ async def fetch_youtube(channel, session):
             uid = f"yt_{vid}"
             if state.is_posted(uid): continue
             try:
-                ts = await asyncio.to_thread(lambda: YouTubeTranscriptApi.list_transcripts(vid).find_transcript(['ru', 'en']).fetch())
+                ts = await asyncio.to_thread(lambda: YouTubeTranscriptApi.list_transcripts(vid).find_transcript(['en', 'ru']).fetch())
                 full = " ".join([t['text'] for t in ts])
                 if passes_local_filters(entry.title, full):
                     items.append(NewsItem("video", entry.title, full[:5000], entry.link, f"YouTube {channel['name']}", uid))
@@ -371,7 +438,7 @@ def clean_text(text):
 # ============ MAIN ============
 
 async def main():
-    logger.info("🚀 Starting (1 POST LIMIT MODE)...")
+    logger.info("🚀 Starting (Western Sources → Russian Posts)")
     
     async with aiohttp.ClientSession() as session:
         tasks = [fetch_rss(s, session) for s in RSS_SOURCES] + [fetch_youtube(c, session) for c in YOUTUBE_CHANNELS]
@@ -382,7 +449,7 @@ async def main():
         random.shuffle(all_items)
         
         posts_done = 0
-        MAX_POSTS_PER_RUN = 1  # <--- ВОТ ГЛАВНОЕ ИСПРАВЛЕНИЕ
+        MAX_POSTS_PER_RUN = 1
         
         for item in all_items:
             if posts_done >= MAX_POSTS_PER_RUN:
@@ -404,7 +471,6 @@ async def main():
                 continue
             
             try:
-                # Решение: Текст или Картинка?
                 if len(post_text) > TEXT_ONLY_THRESHOLD:
                     logger.info("📜 Text only (Long read)")
                     await bot.send_message(CHANNEL_ID, text=post_text)
@@ -427,17 +493,26 @@ async def main():
     await bot.session.close()
 
 if __name__ == "__main__":
-    # Настройки источников
+    # ============ ЗАПАДНЫЕ ИСТОЧНИКИ (ENGLISH) ============
     RSS_SOURCES = [
-        {"name": "Kaspersky", "url": "https://www.kaspersky.ru/blog/feed/"},
-        {"name": "Kod.ru", "url": "https://kod.ru/rss/"},
+        # Топовые англоязычные источники по кибербезопасности
         {"name": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/"},
-        {"name": "Habr Security", "url": "https://habr.com/ru/rss/hub/infosecurity/all/?fl=ru"},
-        {"name": "SecurityLab", "url": "https://www.securitylab.ru/rss/news/"},
+        {"name": "The Hacker News", "url": "https://feeds.feedburner.com/TheHackersNews"},
+        {"name": "Krebs on Security", "url": "https://krebsonsecurity.com/feed/"},
+        {"name": "Dark Reading", "url": "https://www.darkreading.com/rss_simple.asp"},
+        {"name": "Threatpost", "url": "https://threatpost.com/feed/"},
+        {"name": "Ars Technica Security", "url": "https://arstechnica.com/tag/security/feed/"},
+        {"name": "SecurityWeek", "url": "https://www.securityweek.com/feed/"},
     ]
+    
     YOUTUBE_CHANNELS = [
-        {"name": "Overbafer1", "id": "UC-lHJ97lqoOGgsLFuQ8Y8_g"},
+        # Топовые англоязычные каналы про хакинг/безопасность
+        {"name": "John Hammond", "id": "UCVeW9qkBjo3zosnqUbG7CFw"},
         {"name": "NetworkChuck", "id": "UC9x0AN7BWHpXyPic4IQC74Q"},
+        {"name": "LiveOverflow", "id": "UClcE-kVhqyiHCcjYwcpfj9w"},
+        {"name": "IppSec", "id": "UCa6eh7gCkpPo5XXUDfygQQA"},
+        {"name": "STÖK", "id": "UCQN2DsjnYH60SFBIA6IkNwg"},
     ]
     
     asyncio.run(main())
+
