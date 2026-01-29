@@ -134,9 +134,9 @@ class GroqBudget:
 
 budget = GroqBudget()
 
-# ============ ФИЛЬТРЫ (ОБНОВЛЕНЫ ДЛЯ АНГЛИЙСКОГО) ============
+# ============ ФИЛЬТРЫ ============
 
-# Теперь стоп-слова на английском (источники английские)
+# Стоп-слова для английских источников
 STOP_WORDS = [
     "headphone", "jbl", "bluetooth headset", "earbuds",
     "quarterly earnings", "appointed ceo", "marketing campaign", "conference announcement",
@@ -151,51 +151,119 @@ BANNED_PHRASES = [
     "установите обновления", "используйте двухфакторную", "сложные пароли",
     "надежные решения", "системы обнаружения", "мониторинг трафика",
     "обеспечения безопасности", "защитить свои данные", "потенциальных атак",
-    "устранять уязвимости", "злоумышленниками для атак"
+    "устранять уязвимости", "злоумышленниками для атак", "соблюдайте осторожность",
+    "базовые правила", "кибергигиен", "не открывайте подозрительные",
+    "используйте надежн", "регулярное резервное", "обучение сотрудников",
+    "повышение осведомленности", "комплексный подход", "многоуровневая защита"
 ]
 
-# Технические термины (на английском и русском — для проверки обоих)
+# СИЛЬНЫЕ технические индикаторы (конкретика)
+STRONG_TECH_INDICATORS = [
+    "cve-", "0day", "zero-day", "exploit", "payload", "backdoor", "trojan",
+    "ransomware", "apt28", "apt29", "lazarus", "sandworm", "fancy bear",
+    "cozy bear", "killnet", "lockbit", "blackcat", "alphv", "conti",
+    ".exe", ".dll", ".apk", ".ps1", ".bat", ".sh", ".vbs",
+    "powershell", "mimikatz", "cobalt strike", "metasploit", "nmap",
+    "c2 server", "c&c", "command and control", "reverse shell",
+    "sql injection", "xss", "csrf", "rce", "lpe", "privilege escalation",
+    "buffer overflow", "heap spray", "use-after-free", "race condition",
+    "порт 445", "порт 3389", "порт 22", "порт 80", "порт 443",
+    "smb", "rdp", "ssh", "ftp", "telnet", "vnc",
+    "lateral movement", "persistence", "exfiltration", "c2 beacon"
+]
+
+# Обычные технические термины (для подсчёта)
 TECH_INDICATORS = [
     "cve-", "0day", "exploit", "payload", "shell", "sudo", "root",
-    "port ", "ip", "dns", "ssh", "rdp", "smb", "http", "api",
-    "token", "hash", "salt", "aes", "rsa", "tls", "ssl",
+    "dns", "ssh", "rdp", "smb", "api", "token", "hash", "aes", "rsa", "tls", "ssl",
     "android", "ios", "windows", "linux", "macos",
-    "chrome", "firefox", "safari", "edge",
-    "apt", "lazarus", "fancy bear", "sandworm", "apt28", "apt29",
-    ".exe", ".dll", ".apk", ".sh", ".bat", ".js",
-    "phishing", "malware", "ransomware", "backdoor", "trojan",
-    # Русские варианты
-    "порт ", "вредонос", "эксплойт", "уязвимост", "фишинг"
+    "chrome", "firefox", "safari", "edge", "telegram", "whatsapp",
+    "apt", "phishing", "malware", "ransomware", "backdoor", "trojan",
+    "вредонос", "эксплойт", "уязвимост", "фишинг", "хакер", "взлом",
+    "утечк", "брешь", "патч", "обновлени"
 ]
 
+
 def is_too_generic(text: str) -> bool:
-    """Проверка сгенерированного РУССКОГО поста на банальности"""
+    """Улучшенная проверка сгенерированного РУССКОГО поста на банальности"""
     text_lower = text.lower()
     
+    # 1. Проверка банальных фраз (порог 2+)
     banned_count = sum(1 for phrase in BANNED_PHRASES if phrase in text_lower)
-    if banned_count >= 1:
-        logger.info(f"⚠️ Generic phrase detected: {banned_count} matches")
+    if banned_count >= 2:
+        logger.info(f"⚠️ Too many generic phrases: {banned_count}")
         return True
     
+    # 2. Проверка на СИЛЬНЫЕ технические индикаторы
+    strong_tech = sum(1 for t in STRONG_TECH_INDICATORS if t in text_lower)
+    
+    # 3. Проверка на конкретные версии/номера/CVE
+    has_version = bool(re.search(r'\d+\.\d+\.\d+', text))  # Версия типа 1.2.3
+    has_cve = bool(re.search(r'CVE-\d{4}-\d+', text, re.I))  # CVE-2024-12345
+    has_port = bool(re.search(r'порт\s*\d+', text_lower))  # порт 445
+    has_ip = bool(re.search(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', text))  # IP адрес
+    has_path = bool(re.search(r'[A-Z]:\\|/etc/|/var/|/tmp/', text))  # Путь к файлу
+    has_command = bool(re.search(r'(sudo|chmod|chown|netsh|reg add|powershell|cmd)', text_lower))  # Команды
+    has_hash = bool(re.search(r'[a-f0-9]{32,64}', text_lower))  # MD5/SHA хеш
+    
+    specifics_count = sum([has_version, has_cve, has_port, has_ip, has_path, has_command, has_hash])
+    
+    # Если нет ни одного конкретного индикатора
+    if specifics_count == 0 and strong_tech < 2:
+        logger.info(f"⚠️ No specific details (versions/CVE/ports/paths): strong_tech={strong_tech}")
+        return True
+    
+    # Если есть 1 банальная фраза, требуем больше конкретики
+    if banned_count == 1 and specifics_count == 0 and strong_tech < 3:
+        logger.info(f"⚠️ Has generic phrase but lacks specifics")
+        return True
+    
+    # 4. Общие технические термины (мягкая проверка)
     tech_count = sum(1 for term in TECH_INDICATORS if term in text_lower)
     if tech_count < 2:
-        logger.info(f"⚠️ Not enough technical details: {tech_count}/2")
+        logger.info(f"⚠️ Not enough technical terms: {tech_count}/2")
         return True
     
-    lines = text.split('\n')
-    advice_lines = [l for l in lines if l.strip().startswith('•') or l.strip().startswith('-')]
-    if len(advice_lines) > 0 and len(advice_lines) / max(len(lines), 1) > 0.4:
-        logger.info(f"⚠️ Too many generic tips: {len(advice_lines)} lines")
+    # 5. Проверка на избыток советов-списков
+    lines = [l for l in text.split('\n') if l.strip()]
+    advice_lines = [l for l in lines if l.strip().startswith(('•', '-', '✓', '—', '–'))]
+    if len(advice_lines) >= 4 and len(lines) > 0:
+        if len(advice_lines) / len(lines) > 0.5:
+            # Проверяем, есть ли в советах конкретика
+            advice_text = ' '.join(advice_lines).lower()
+            advice_has_specifics = (
+                bool(re.search(r'\d+\.\d+', advice_text)) or
+                bool(re.search(r'cve-', advice_text)) or
+                bool(re.search(r'порт\s*\d+', advice_text)) or
+                any(t in advice_text for t in STRONG_TECH_INDICATORS[:20])
+            )
+            if not advice_has_specifics:
+                logger.info(f"⚠️ Too many generic tips without specifics: {len(advice_lines)} lines")
+                return True
+    
+    # 6. Проверка минимальной длины полезного контента
+    # Убираем эмодзи, пробелы, ссылки
+    clean_text = re.sub(r'[^\w\s]', '', text)
+    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+    words = clean_text.split()
+    if len(words) < 30:
+        logger.info(f"⚠️ Post too short: {len(words)} words")
         return True
     
+    logger.info(f"✅ Post passed quality check: {specifics_count} specifics, {strong_tech} strong terms, {banned_count} banned phrases")
     return False
+
 
 def passes_local_filters(title: str, text: str) -> bool:
     """Фильтрация АНГЛИЙСКОГО исходника"""
     content = (title + " " + text).lower()
+    
+    # Проверка стоп-слов
     if any(w in content for w in STOP_WORDS):
-        logger.info(f"🚫 Stop word found: {title}")
+        logger.info(f"🚫 Stop word found: {title[:50]}...")
         return False
+    
+    # Минимальная длина
     if len(text) < 100:
         return False
     
@@ -203,13 +271,15 @@ def passes_local_filters(title: str, text: str) -> bool:
     security_keywords = [
         "vulnerability", "exploit", "malware", "ransomware", "phishing",
         "hacker", "breach", "attack", "threat", "zero-day", "patch",
-        "security", "cybersecurity", "cyber attack", "data breach"
+        "security", "cybersecurity", "cyber attack", "data breach",
+        "cve-", "backdoor", "trojan", "apt", "intrusion", "compromise"
     ]
     if not any(kw in content for kw in security_keywords):
-        logger.info(f"🚫 No security keywords: {title}")
+        logger.info(f"🚫 No security keywords: {title[:50]}...")
         return False
     
     return True
+
 
 # ============ GROQ CALLER ============
 
@@ -242,6 +312,7 @@ async def call_groq(prompt: str, model_pref: str = "heavy", max_tokens: int = 15
             
     return "", 0
 
+
 # ============ ЛОГИКА ============
 
 async def check_duplicate(new_title: str, recent: list) -> bool:
@@ -251,7 +322,7 @@ async def check_duplicate(new_title: str, recent: list) -> bool:
     for old in recent[-20:]:
         norm_old = re.sub(r'\W', '', old.lower())
         if SequenceMatcher(None, norm_new, norm_old).ratio() > 0.6:
-            logger.info(f"🔄 Local duplicate: {new_title}")
+            logger.info(f"🔄 Local duplicate: {new_title[:50]}...")
             return True
             
     history = "\n".join(f"- {t}" for t in recent[-10:])
@@ -260,8 +331,8 @@ async def check_duplicate(new_title: str, recent: list) -> bool:
     
     return "YES" in ans.upper()
 
+
 async def generate_post(item) -> Optional[str]:
-    # ПРОМПТ С ПЕРЕВОДОМ (как в первом скрипте)
     prompt = f"""Ты — редактор русскоязычного Telegram-канала про кибербезопасность (30к+ подписчиков).
 
 ИСХОДНАЯ НОВОСТЬ (English):
@@ -270,41 +341,51 @@ async def generate_post(item) -> Optional[str]:
 
 ТВОЯ ЗАДАЧА:
 1. Прочитай английский текст и переведи суть на РУССКИЙ язык
-2. Напиши пост на РУССКОМ с конкретными рекомендациями
+2. Напиши пост на РУССКОМ с конкретными техническими деталями
 
 СТРОГИЕ ПРАВИЛА:
-❌ НЕ ПИШИ банальности:
-   - "обновляйте ПО", "антивирус", "будьте осторожны"
-   - "надежные пароли", "системы обнаружения"
-   - "защитить свои данные", "мониторинг трафика"
+❌ ЗАПРЕЩЕНО писать банальности:
+   - "регулярно обновляйте ПО" (без указания конкретной версии)
+   - "используйте антивирус", "будьте осторожны"
+   - "надежные пароли", "двухфакторная аутентификация"
+   - "системы обнаружения", "мониторинг трафика"
+   - "защитить свои данные", "соблюдайте кибергигиену"
+   - "обучение сотрудников", "повышение осведомленности"
 
-✅ ОБЯЗАТЕЛЬНО укажи:
-   - Конкретные уязвимости (CVE-номера, версии софта)
-   - Технические детали атаки (порты, протоколы, команды)
-   - Специфические действия для защиты (не "обновитесь", а "обновитесь до Chrome 131.0.6778.264")
+✅ ОБЯЗАТЕЛЬНО включи КОНКРЕТИКУ:
+   - CVE-номера уязвимостей (CVE-2024-XXXXX)
+   - Точные версии софта (Chrome 131.0.6778.264, Windows 11 23H2)
+   - Номера портов (порт 445, порт 3389)
+   - Пути к файлам (C:\\Windows\\Temp\\evil.dll, /etc/passwd)
+   - Команды для проверки/защиты (netsh, powershell, grep)
+   - Названия малвари/групп (LockBit, APT29, Cobalt Strike)
+   - IP-адреса или домены (если есть в источнике)
+   - Хеши файлов (MD5/SHA256, если есть)
 
-📌 Если нет технических деталей или польза неясна — пиши SKIP
+📌 Если в источнике НЕТ технических деталей — пиши SKIP
 
-ФОРМАТ (на РУССКОМ):
-🔥 [Заголовок с конкретикой]
+ФОРМАТ ПОСТА (на РУССКОМ):
+🔥 [Конкретный заголовок с версией/CVE/названием угрозы]
 
-[2-3 предложения: ЧТО произошло + КАК работает атака]
+[2-3 предложения: ЧТО произошло + технические детали атаки]
 
 👇 ЧТО СДЕЛАТЬ:
-• [Конкретное действие с версиями/командами/настройками]
-• [Еще одно конкретное действие]
+• [Конкретное действие с версией/командой/путём]
+• [Ещё одно конкретное действие]
 
-ПРИМЕРЫ ХОРОШЕГО:
-✅ "Обновите Chrome до версии 131.0.6778.108 (CVE-2024-12345)"
-✅ "Закройте порт 445 (SMB) командой: netsh advfirewall firewall add rule..."
-✅ "Проверьте наличие файла evil.dll в C:\\Windows\\Temp"
+ПРИМЕРЫ ХОРОШЕГО ПОСТА:
+✅ "Обновите Chrome до 131.0.6778.108 — исправлена CVE-2024-12692 (RCE через V8)"
+✅ "Заблокируйте порт 445: netsh advfirewall firewall add rule name='Block SMB' dir=in action=block protocol=TCP localport=445"
+✅ "Проверьте наличие C:\\Windows\\Temp\\svchost.exe (не путать с системным)"
+✅ "APT29 использует Cobalt Strike с C2 на домене evil.example[.]com"
 
-ПРИМЕРЫ ПЛОХОГО:
-❌ "Используйте надежные решения для мониторинга"
-❌ "Регулярно обновляйте программное обеспечение"
+ПРИМЕРЫ ПЛОХОГО (НЕ ПИСАТЬ ТАК):
+❌ "Используйте надежные решения для мониторинга сети"
+❌ "Регулярно обновляйте программное обеспечение"  
 ❌ "Будьте бдительны при переходе по ссылкам"
+❌ "Проводите обучение сотрудников по кибербезопасности"
 
-Пост на РУССКОМ или SKIP:"""
+Напиши пост на РУССКОМ языке или SKIP:"""
 
     text, _ = await call_groq(prompt, "heavy", 1200)
     
@@ -312,11 +393,13 @@ async def generate_post(item) -> Optional[str]:
         logger.info("⏩ AI returned SKIP or too short")
         return None
     
+    # Проверка на банальности
     if is_too_generic(text):
-        logger.info(f"⏩ Post is too generic after generation")
+        logger.info(f"⏩ Post rejected: too generic")
         return None
         
     return text + f"\n\n🔗 <a href='{item.link}'>Источник</a>"
+
 
 # ============ ИЗОБРАЖЕНИЯ ============
 
@@ -340,6 +423,7 @@ async def generate_image(title, session):
         logger.warning(f"   ⚠️ Image generation failed: {e}")
     return None
 
+
 # ============ КЛАССЫ ============
 
 @dataclass
@@ -353,6 +437,7 @@ class NewsItem:
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 groq_client = Groq(api_key=GROQ_API_KEY)
+
 
 # ============ STATE ============
 
@@ -386,6 +471,7 @@ class State:
 
 state = State()
 
+
 # ============ СБОРЩИКИ ============
 
 async def fetch_rss(source, session):
@@ -410,6 +496,7 @@ async def fetch_rss(source, session):
         logger.warning(f"⚠️ RSS fetch error ({source['name']}): {e}")
     return items
 
+
 async def fetch_youtube(channel, session):
     items = []
     try:
@@ -431,9 +518,11 @@ async def fetch_youtube(channel, session):
     except: pass
     return items
 
+
 def clean_text(text):
     if not text: return ""
     return html.unescape(re.sub(r'<[^>]+>', ' ', text)).strip()
+
 
 # ============ MAIN ============
 
@@ -445,10 +534,11 @@ async def main():
         results = await asyncio.gather(*tasks)
         all_items = [i for r in results for i in r]
         
-        logger.info(f"📦 Found {len(all_items)} items")
+        logger.info(f"📦 Found {len(all_items)} items after local filters")
         random.shuffle(all_items)
         
         posts_done = 0
+        posts_rejected = 0
         MAX_POSTS_PER_RUN = 1
         
         for item in all_items:
@@ -459,7 +549,7 @@ async def main():
                 logger.warning("⚠️ Daily budget exhausted")
                 break
             
-            logger.info(f"🔍 Analyzing: {item.title}")
+            logger.info(f"🔍 Analyzing: {item.title[:60]}...")
             
             if await check_duplicate(item.title, state.data["recent_titles"]):
                 state.mark_posted(item.uid, item.title)
@@ -468,6 +558,8 @@ async def main():
             post_text = await generate_post(item)
             if not post_text:
                 state.mark_posted(item.uid, item.title)
+                posts_rejected += 1
+                logger.info(f"⏩ Rejected ({posts_rejected} total)")
                 continue
             
             try:
@@ -490,12 +582,14 @@ async def main():
             except Exception as e:
                 logger.error(f"Telegram Error: {e}")
 
+        logger.info(f"📊 Summary: {posts_done} posted, {posts_rejected} rejected as generic")
+
     await bot.session.close()
+
 
 if __name__ == "__main__":
     # ============ ЗАПАДНЫЕ ИСТОЧНИКИ (ENGLISH) ============
     RSS_SOURCES = [
-        # Топовые англоязычные источники по кибербезопасности
         {"name": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/"},
         {"name": "The Hacker News", "url": "https://feeds.feedburner.com/TheHackersNews"},
         {"name": "Krebs on Security", "url": "https://krebsonsecurity.com/feed/"},
@@ -506,7 +600,6 @@ if __name__ == "__main__":
     ]
     
     YOUTUBE_CHANNELS = [
-        # Топовые англоязычные каналы про хакинг/безопасность
         {"name": "John Hammond", "id": "UCVeW9qkBjo3zosnqUbG7CFw"},
         {"name": "NetworkChuck", "id": "UC9x0AN7BWHpXyPic4IQC74Q"},
         {"name": "LiveOverflow", "id": "UClcE-kVhqyiHCcjYwcpfj9w"},
@@ -515,4 +608,3 @@ if __name__ == "__main__":
     ]
     
     asyncio.run(main())
-
