@@ -55,6 +55,11 @@ MAX_POSTED_IDS = 500
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=25)
 IMAGE_TIMEOUT = aiohttp.ClientTimeout(total=40)
 
+# 🆕 ПАРАМЕТРЫ ЗАЩИТЫ ОТ ПОВТОРОВ
+RECENT_POSTS_CHECK = 10  # Проверять последние N постов
+RECENT_SIMILARITY_THRESHOLD = 0.40  # Порог схожести для последних постов (строже!)
+MIN_TOPIC_DIVERSITY = 3  # Минимум разных тем в последних 5 постах
+
 # ============ МОДЕЛИ ============
 
 @dataclass
@@ -593,7 +598,7 @@ def clean_banal_advice(text: str) -> str:
     return '\n'.join(cleaned_lines)
 
 
-# ============ СИСТЕМА ПРОВЕРКИ ДУБЛИКАТОВ ============
+# ============ 🆕 УЛУЧШЕННАЯ СИСТЕМА ПРОВЕРКИ ДУБЛИКАТОВ ============
 
 def normalize_title(title: str) -> str:
     """Нормализация заголовка для сравнения"""
@@ -635,6 +640,36 @@ def extract_key_entities(text: str) -> set:
     return entities
 
 
+# 🆕 ОПРЕДЕЛЕНИЕ ТЕМЫ
+def detect_topic(title: str, text: str) -> str:
+    """Определяет тему security-новости"""
+    content = (title + " " + text).lower()
+    
+    # Приоритет: специфичные темы -> общие
+    if any(x in content for x in ['ransomware', 'lockbit', 'blackcat', 'alphv', 'clop', 'revil']):
+        return 'ransomware'
+    
+    if any(x in content for x in ['apt', 'lazarus', 'apt28', 'apt29', 'sandworm', 'fancy bear', 'nation-state']):
+        return 'apt'
+    
+    if re.search(r'cve-\d{4}-\d+', content):
+        return 'vulnerability'
+    
+    if any(x in content for x in ['phishing', 'social engineering', 'scam', 'credential']):
+        return 'phishing'
+    
+    if any(x in content for x in ['ddos', 'botnet', 'mirai', 'distributed denial']):
+        return 'ddos'
+    
+    if any(x in content for x in ['data breach', 'leak', 'exposed database', 'stolen data']):
+        return 'breach'
+    
+    if any(x in content for x in ['patch', 'update', 'security fix', 'hotfix']):
+        return 'patch'
+    
+    return 'general'
+
+
 def calculate_similarity(title1: str, text1: str, title2: str, text2: str) -> float:
     """Комплексная проверка схожести двух новостей"""
     
@@ -670,7 +705,8 @@ class State:
         self.data = {
             "posted_ids": {},
             "recent_titles": [],
-            "recent_posts": []
+            "recent_posts": [],
+            "recent_topics": []  # 🆕 Для отслеживания тем
         }
         self._load()
     
@@ -682,6 +718,8 @@ class State:
                     self.data.update(loaded)
                     if "recent_posts" not in self.data:
                         self.data["recent_posts"] = []
+                    if "recent_topics" not in self.data:
+                        self.data["recent_topics"] = []
             except:
                 pass
     
@@ -700,14 +738,19 @@ class State:
     def is_posted(self, uid):
         return uid in self.data["posted_ids"]
     
+    # 🆕 УСИЛЕННАЯ ПРОВЕРКА ДУБЛИКАТОВ
     def is_duplicate(self, title: str, text: str) -> bool:
+        """Проверяет дубликаты с учётом последних постов"""
         norm_new = normalize_title(title)
+        
+        # 1. Проверка заголовков
         for old_title in self.data["recent_titles"][-30:]:
             norm_old = normalize_title(old_title)
             if SequenceMatcher(None, norm_new, norm_old).ratio() > 0.65:
                 logger.info(f"🔄 Title duplicate: {title[:50]}...")
                 return True
         
+        # 2. Проверка контента (обычная)
         for old_post in self.data["recent_posts"][-20:]:
             old_title = old_post.get("title", "")
             old_text = old_post.get("text", "")
@@ -720,7 +763,77 @@ class State:
         
         return False
     
-    def mark_posted(self, uid: str, title: str, text: str = ""):
+    # 🆕 ПРОВЕРКА НА ПОХОЖЕСТЬ С ПОСЛЕДНИМИ
+    def is_too_similar_to_recent(self, title: str, text: str) -> bool:
+        """Более строгая проверка для последних N постов"""
+        recent = self.data["recent_posts"][-RECENT_POSTS_CHECK:]
+        
+        if len(recent) < 2:
+            return False
+        
+        new_entities = extract_key_entities(title + " " + text)
+        new_topic = detect_topic(title, text)
+        
+        for post in recent:
+            old_title = post.get("title", "")
+            old_text = post.get("text", "")
+            old_topic = post.get("topic", "general")
+            
+            # Проверка 1: Похожесть заголовка (строже!)
+            norm_new = normalize_title(title)
+            norm_old = normalize_title(old_title)
+            title_sim = SequenceMatcher(None, norm_new, norm_old).ratio()
+            
+            if title_sim > RECENT_SIMILARITY_THRESHOLD:
+                logger.info(f"🔄 [RECENT] Similar title: {old_title[:40]}")
+                return True
+            
+            # Проверка 2: Та же тема + схожие сущности
+            old_entities = extract_key_entities(old_title + " " + old_text)
+            
+            if new_topic == old_topic and new_topic != 'general':
+                common = new_entities & old_entities
+                if len(common) >= 2:
+                    logger.info(f"🔄 [RECENT] Same topic '{new_topic}' + entities: {common}")
+                    return True
+            
+            # Проверка 3: Общая схожесть контента (строже)
+            similarity = calculate_similarity(title, text, old_title, old_text)
+            if similarity > RECENT_SIMILARITY_THRESHOLD:
+                logger.info(f"🔄 [RECENT] Similar content ({similarity:.2f})")
+                return True
+        
+        return False
+    
+    # 🆕 СТАТИСТИКА ПО ТЕМАМ
+    def get_recent_topics_stats(self) -> dict:
+        """Возвращает статистику по темам последних постов"""
+        recent = self.data["recent_topics"][-10:]
+        stats = {}
+        for topic in recent:
+            stats[topic] = stats.get(topic, 0) + 1
+        return stats
+    
+    # 🆕 ПРОВЕРКА РАЗНООБРАЗИЯ
+    def needs_diversity(self) -> str:
+        """Возвращает доминантную тему, если нужно разнообразие"""
+        if len(self.data["recent_topics"]) < 5:
+            return ""
+        
+        last_5 = self.data["recent_topics"][-5:]
+        stats = {}
+        for topic in last_5:
+            stats[topic] = stats.get(topic, 0) + 1
+        
+        # Если одна тема доминирует
+        for topic, count in stats.items():
+            if count >= 3:  # 3+ одинаковых из 5
+                logger.info(f"⚖️ Diversity needed: too many '{topic}' ({count}/5)")
+                return topic
+        
+        return ""
+    
+    def mark_posted(self, uid: str, title: str, text: str = "", topic: str = "general"):
         if len(self.data["posted_ids"]) > MAX_POSTED_IDS:
             self.data["posted_ids"] = dict(sorted(
                 self.data["posted_ids"].items(),
@@ -736,10 +849,16 @@ class State:
         self.data["recent_posts"].append({
             "title": title,
             "text": text[:1000],
+            "topic": topic,
             "time": int(time.time())
         })
         if len(self.data["recent_posts"]) > 30:
             self.data["recent_posts"] = self.data["recent_posts"][-30:]
+        
+        # 🆕 Сохраняем тему
+        self.data["recent_topics"].append(topic)
+        if len(self.data["recent_topics"]) > 15:
+            self.data["recent_topics"] = self.data["recent_topics"][-15:]
         
         self.save()
 
@@ -1020,7 +1139,7 @@ def clean_text(text: str) -> str:
 # ============ MAIN ============
 
 async def main():
-    logger.info("🚀 Starting KiberSOS (Enhanced Anti-Banality)")
+    logger.info("🚀 Starting KiberSOS v2.0 (Enhanced Anti-Repetition)")
     
     async with aiohttp.ClientSession() as session:
         logger.info("📡 Fetching sources...")
@@ -1038,13 +1157,30 @@ async def main():
             await bot.session.close()
             return
         
-        random.shuffle(all_items)
+        # 🆕 ПРОВЕРКА РАЗНООБРАЗИЯ
+        dominant_topic = state.needs_diversity()
+        if dominant_topic:
+            # Отдаём приоритет другим темам
+            other_topics = []
+            same_topic = []
+            
+            for item in all_items:
+                topic = detect_topic(item.title, item.text)
+                if topic == dominant_topic:
+                    same_topic.append(item)
+                else:
+                    other_topics.append(item)
+            
+            all_items = other_topics + same_topic
+            logger.info(f"⚖️ Reordered: {len(other_topics)} other topics first")
+        else:
+            random.shuffle(all_items)
         
         posts_done = 0
         posts_rejected = 0
         duplicates_skipped = 0
         MAX_POSTS_PER_RUN = 1
-        MAX_ATTEMPTS = 10
+        MAX_ATTEMPTS = 15  # 🆕 Увеличили попытки
         attempts = 0
         
         for item in all_items:
@@ -1061,14 +1197,24 @@ async def main():
             attempts += 1
             logger.info(f"🔍 [{attempts}/{MAX_ATTEMPTS}] {item.source}: {item.title[:50]}...")
             
+            # Обычная проверка дубликатов
             if state.is_duplicate(item.title, item.text):
-                state.mark_posted(item.uid, item.title, item.text)
+                topic = detect_topic(item.title, item.text)
+                state.mark_posted(item.uid, item.title, item.text, topic)
+                duplicates_skipped += 1
+                continue
+            
+            # 🆕 ПРОВЕРКА НА ПОХОЖЕСТЬ С ПОСЛЕДНИМИ
+            if state.is_too_similar_to_recent(item.title, item.text):
+                topic = detect_topic(item.title, item.text)
+                state.mark_posted(item.uid, item.title, item.text, topic)
                 duplicates_skipped += 1
                 continue
             
             post_text = await generate_post(item, session)
             if not post_text:
-                state.mark_posted(item.uid, item.title, item.text)
+                topic = detect_topic(item.title, item.text)
+                state.mark_posted(item.uid, item.title, item.text, topic)
                 posts_rejected += 1
                 continue
             
@@ -1088,19 +1234,27 @@ async def main():
                         await bot.send_message(CHANNEL_ID, text=post_text)
                 
                 logger.info("✅ Posted!")
-                state.mark_posted(item.uid, item.title, item.text)
+                topic = detect_topic(item.title, item.text)
+                state.mark_posted(item.uid, item.title, item.text, topic)
                 posts_done += 1
                 
             except Exception as e:
                 logger.error(f"Telegram error: {e}")
         
         logger.info(f"📊 Done: {posts_done} posted, {posts_rejected} rejected, {duplicates_skipped} duplicates")
+        
+        # 🆕 СТАТИСТИКА ПО ТЕМАМ
+        stats = state.get_recent_topics_stats()
+        if stats:
+            logger.info(f"📈 Recent topics: {stats}")
     
     await bot.session.close()
 
 
 if __name__ == "__main__":
+    # 🆕 РАСШИРЕННЫЙ СПИСОК RSS (10 -> 20 источников)
     RSS_SOURCES = [
+        # Основные
         {"name": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/"},
         {"name": "TheHackerNews", "url": "https://feeds.feedburner.com/TheHackersNews"},
         {"name": "KrebsOnSecurity", "url": "https://krebsonsecurity.com/feed/"},
@@ -1111,6 +1265,18 @@ if __name__ == "__main__":
         {"name": "WeLiveSecurity", "url": "https://www.welivesecurity.com/en/rss/feed/"},
         {"name": "GrahamCluley", "url": "https://grahamcluley.com/feed/"},
         {"name": "Schneier", "url": "https://www.schneier.com/feed/"},
+        
+        # 🆕 ДОПОЛНИТЕЛЬНЫЕ ИСТОЧНИКИ
+        {"name": "CyberScoop", "url": "https://www.cyberscoop.com/feed/"},
+        {"name": "HackRead", "url": "https://www.hackread.com/feed/"},
+        {"name": "InfoSecurity Magazine", "url": "https://www.infosecurity-magazine.com/rss/news/"},
+        {"name": "ZDNet Security", "url": "https://www.zdnet.com/topic/security/rss.xml"},
+        {"name": "Malwarebytes Labs", "url": "https://blog.malwarebytes.com/feed/"},
+        {"name": "RecordedFuture", "url": "https://www.recordedfuture.com/feed"},
+        {"name": "Kaspersky", "url": "https://www.kaspersky.com/blog/feed/"},
+        {"name": "Cisco Talos", "url": "https://blog.talosintelligence.com/feeds/posts/default"},
+        {"name": "Unit42", "url": "https://unit42.paloaltonetworks.com/feed/"},
+        {"name": "CERT-EU", "url": "https://cert.europa.eu/blog/atom.xml"},
     ]
     
     YOUTUBE_CHANNELS = [
@@ -1120,4 +1286,5 @@ if __name__ == "__main__":
     ]
     
     asyncio.run(main())
+
 
