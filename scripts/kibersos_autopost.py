@@ -142,10 +142,155 @@ class GroqBudget:
 
 budget = GroqBudget()
 
-# ============ ФИЛЬТРЫ (ЖЁСТКИЙ АНТИОФФТОП) ============
+# ============ УСИЛЕННАЯ ЗАЩИТА ОТ БАНАЛЬНОСТЕЙ ============
 
+# === РАСШИРЕННЫЙ СПИСОК БАНАЛЬНОСТЕЙ ===
+BANNED_PHRASES = [
+    # Базовые банальности
+    "из доверенных источников", "регулярно обновляйте", "будьте бдительны",
+    "используйте антивирус", "надёжный пароль", "надежный пароль",
+    "будьте осторожны", "проверяйте ссылки", "сложные пароли",
+    "надежные решения", "системы обнаружения", "мониторинг трафика",
+    "защитить свои данные", "потенциальных атак", "соблюдайте осторожность",
+    "базовые правила", "кибергигиен", "используйте надежн",
+    "регулярное резервное", "обучение сотрудников", "повышение осведомленности",
+    "комплексный подход", "многоуровневая защита", "своевременно устанавливайте",
+    "будьте внимательны", "не открывайте подозрительные", "проявляйте осторожность",
+    
+    # Антивирусные банальности
+    "обновить сигнатуры", "обновите сигнатуры", "обновление сигнатур",
+    "антивирусное ПО", "антивирус", "антивируса", "антивирусные",
+    "включить детекцию", "включите детекцию", "включить обнаружение",
+    "сканировать систему", "провести сканирование", "полное сканирование",
+    
+    # Общие рекомендации без ценности
+    "рекомендуется обновить", "следует обновить", "необходимо обновить",
+    "выпустила исправление", "выпустила патч", "выпустила обновление",
+    "установите последнее обновление", "установите последний патч",
+    "обновитесь до последней версии", "перейдите на последнюю версию",
+    "своевременно устанавливайте обновления", "не откладывайте обновления",
+    
+    # Пустые призывы
+    "осторожность", "бдительность", "внимательность",
+    "проявляйте бдительность", "будьте начеку", "не теряйте бдительность",
+    
+    # Формальности без сути
+    "принять меры", "принять необходимые меры", "предпринять шаги",
+    "предпринять действия", "предпринять меры", "осуществить меры",
+    "обеспечить безопасность", "повысить безопасность", "усилить безопасность",
+    
+    # Резервное копирование (если без конкретики)
+    "делайте резервные копии", "создавайте бэкапы", "резервное копирование",
+    "backup", "регулярно бэкапьте", "храните резервные копии",
+    
+    # MFA/2FA банальности
+    "включите двухфакторную аутентификацию", "включите 2fa", "включите mfa",
+    "используйте двухфакторную", "настройте двухфакторную",
+    
+    # Сетевые банальности
+    "используйте vpn", "подключайтесь через vpn", "включите firewall",
+    "настройте firewall", "используйте межсетевой экран",
+    
+    # Парольные банальности
+    "меняйте пароли", "регулярно меняйте", "используйте уникальные пароли",
+    "не используйте одинаковые пароли", "уникальный пароль для каждого",
+    "парольный менеджер", "менеджер паролей", "используйте менеджер",
+]
+
+# === ЗАПРЕЩЕННЫЕ ШАБЛОНЫ РЕКОМЕНДАЦИЙ ===
+BANNED_ADVICE_PATTERNS = [
+    r'обнови(те|ть)?\s+(сигнатуры|антивирус|защитник|базы)',
+    r'включи(те|ть)?\s+(детекцию|обнаружение|защиту|функцию)',
+    r'установи(те|ть)?\s+(последнее|новое|свежее)\s+(обновление|патч|исправление)',
+    r'обнови(те|ться|ться)?\s+до\s+последней\s+версии',
+    r'сканируй(те|ть)?\s+(систему|устройство|компьютер)',
+    r'проведи(те|ть)?\s+(сканирование|проверку|аудит)',
+    r'используй(те|ть)?\s+(антивирус|защитник|защитное\s+ПО)',
+    r'будь(те)?\s+(осторожны|бдительны|внимательны)',
+    r'проявляй(те)?\s+(осторожность|бдительность|внимательность)',
+    r'проверяй(те|ть)?\s+(ссылки|вложения|письма|файлы)',
+    r'не\s+(открывай(те)?|кликай(те)?)\s+подозрительные',
+    r'создавай(те|ть)?\s+(резервные\s+копии|бэкапы)',
+    r'делай(те|ть)?\s+резервные\s+копии',
+    r'включи(те|ть)?\s+(2fa|mfa|двухфакторную)',
+    r'используй(те|ть)?\s+(vpn|файрвол|межсетевой)',
+    r'регулярно\s+(обновляй(те)?|меняй(те)?|проверяй(те)?)',
+    r'своевременно\s+(устанавливай(те)?|обновляй(те)?)',
+    r'приня(ть|тие)\s+(меры|мер|действия|шаги)',
+    r'обеспеч(ите|ить)\s+безопасность',
+    r'повыс(ите|ить)\s+(уровень\s+)?безопасности',
+    r'усил(ите|ить)\s+(защиту|безопасность)',
+    r'след(ует|ить)\s+(за\s+)?обновлениями',
+    r'монитор(ьте|инг)\s+(трафик|события|логи|активность)',
+    r'обуч(ите|айте)\s+сотрудников',
+    r'повы(сьте|шайте)\s+осведомленность',
+    r'соблюдай(те)?\s+(правила|меры|рекомендации)',
+    r'комплексн(ый|ого|ая)\s+(подход|меры|защита)',
+    r'многоуровнев(ая|ую|ой)\s+защита',
+    r'кибергигиен(а|ы|е|у)',
+]
+
+# === СЛОВА-МАРКЕРЫ КОНКРЕТИКИ (хорошие признаки) ===
+SPECIFIC_INDICATORS = [
+    # Технические детали
+    r'CVE-\d{4}-\d+',  # CVE номера
+    r'\d+\.\d+\.\d+[\.\d+]*',  # Версии ПО
+    r'порт[ы]?\s*\d+',  # Порты
+    r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}',  # IP адреса
+    r'[a-f0-9]{32,64}',  # Хэши
+    r'0x[a-f0-9]+',  # Hex значения
+    r'\b[A-Z]:\\',  # Windows пути
+    r'/etc/|/var/|/tmp/|/usr/|/opt/',  # Linux пути
+    r'\.[exe|dll|apk|ps1|bat|sh|vbs|msi|doc|docx|pdf|zip|rar]{3,4}\b',  # Расширения файлов
+    
+    # Команды
+    r'\b(powershell|cmd|bash|python|curl|wget|netsh|reg\s+add|chmod|chown|sudo|netstat|tasklist|sc\s+query)\b',
+    
+    # Технологии/протоколы
+    r'\b(smb|rdp|ssh|ldap|kerberos|http|https|ftp|smtp|dns|vpn|ipsec|ssl|tls)\b',
+    
+    # Методы атаки
+    r'\b(sql\s*injection|sqli|xss|csrf|ssrf|rce|lpe|rop|heap\s+spray|uaf|use.after.free)\b',
+    
+    # Инструменты
+    r'\b(mimikatz|cobalt\s*strike|metasploit|burp|nmap|wireshark|volatility|yara|sigma)\b',
+    
+    # Термины
+    r'\b(ioc|indicator\s+of\s+compromise|ttp|ttps|mitre\s+att&ck|cvss|epss)\b',
+    
+    # Домены/URL
+    r'\[?\.\]?(com|net|org|ru|io|info|biz|xyz)\b',
+    r'https?://[^\s]+',
+]
+
+# === СИЛЬНЫЕ ТЕХНИЧЕСКИЕ ИНДИКАТОРЫ ===
+STRONG_TECH_INDICATORS = [
+    "cve-", "0day", "zero-day", "exploit", "payload", "backdoor", "trojan",
+    "ransomware", "apt28", "apt29", "lazarus", "sandworm", "fancy bear",
+    "lockbit", "blackcat", "alphv", "conti", "revil", "clop",
+    ".exe", ".dll", ".apk", ".ps1", ".bat", ".sh", ".vbs", ".msi",
+    "powershell", "mimikatz", "cobalt strike", "metasploit",
+    "c2 server", "c&c", "reverse shell", "webshell",
+    "sql injection", "sqli", "xss", "csrf", "rce", "lpe", "ssrf",
+    "buffer overflow", "heap spray", "use-after-free",
+    "smb", "rdp", "ssh", "ldap", "kerberos",
+    "lateral movement", "persistence", "exfiltration",
+    "ioc", "indicator of compromise", "yara", "sigma rule",
+]
+
+TECH_INDICATORS = [
+    "cve", "vulnerability", "exploit", "malware", "ransomware", "phishing",
+    "backdoor", "trojan", "botnet", "ddos", "apt", "threat actor",
+    "zero-day", "patch", "update", "security", "breach", "leak",
+    "hack", "attack", "compromise", "infected", "payload",
+    "windows", "linux", "android", "ios", "chrome", "firefox",
+    "microsoft", "google", "apple", "cisco", "fortinet", "palo alto",
+    "уязвимост", "вредонос", "эксплойт", "фишинг", "хакер", "взлом",
+    "утечк", "атак", "патч", "брешь", "малвар", "ботнет",
+]
+
+# === ФИЛЬТРЫ КОНТЕНТА (без изменений) ===
 STOP_WORDS = [
-    # === ГАДЖЕТЫ/АУДИО ===
     "headphone", "headphones", "earbuds", "earbud", "airpods", "airpod",
     "earphone", "earphones", "headset review", "audio review",
     "bluetooth speaker", "wireless speaker", "portable speaker",
@@ -156,37 +301,25 @@ STOP_WORDS = [
     "best headphones", "headphone review", "earbuds review",
     "wireless earbuds", "true wireless", "anc headphones",
     "audio gear", "listening experience", "hi-fi", "hi-res audio",
-    
-    # === СМАРТФОНЫ/ГАДЖЕТЫ ===
     "phone review", "smartphone review", "tablet review",
     "camera review", "lens review", "best phone", "phone comparison",
     "unboxing", "hands-on review", "first impressions",
     "battery life test", "screen quality", "display review",
-    
-    # === БИЗНЕС-НОВОСТИ ===
     "quarterly earnings", "quarterly results", "fiscal quarter", "fiscal year",
     "appointed ceo", "new ceo", "steps down as", "resigns as ceo",
     "marketing campaign", "brand ambassador", "product launch event",
     "ipo filing", "stock price", "shares rose", "shares fell", "market cap",
     "investor relations", "shareholder", "dividend",
-    
-    # === КРИПТО/ФИНАНСЫ ===
     "bitcoin price", "ethereum price", "crypto trading", "nft trading",
     "forex trading", "investment advice", "trading strategy",
     "casino", "gambling", "betting", "poker", "slots",
     "price prediction", "bull run", "bear market",
-    
-    # === СПАМ ===
     "weight loss", "diet pill", "supplement", "miracle cure",
     "free iphone", "you won", "congratulations you", "claim your prize",
     "work from home", "make money fast", "passive income",
-    
-    # === РАЗВЛЕЧЕНИЯ ===
     "game review", "movie review", "album review", "book review",
     "netflix series", "streaming service", "spotify playlist",
     "box office", "entertainment news", "celebrity",
-    
-    # === LIFESTYLE ===
     "travel guide", "hotel review", "restaurant review",
     "fashion", "beauty", "skincare", "makeup",
 ]
@@ -213,7 +346,7 @@ SECURITY_KEYWORDS = [
     "incident", "security incident",
     "patch", "patches", "patched", "patching",
     "security update", "security patch", "emergency patch",
-    "cve-", "security flaw", "security bug", "security hole", "security issue",
+    "security flaw", "security bug", "security hole", "security issue",
     "security advisory", "security bulletin", "critical update",
     "security fix", "hotfix",
     "apt", "threat actor", "threat group", "nation-state", "state-sponsored",
@@ -236,43 +369,6 @@ SECURITY_KEYWORDS = [
     "command and control", "c2 server", "c&c",
     "ioc", "indicator of compromise",
     "forensic", "incident response",
-]
-
-BANNED_PHRASES = [
-    "из доверенных источников", "регулярно обновляйте", "будьте бдительны",
-    "используйте антивирус", "надёжный пароль", "надежный пароль",
-    "будьте осторожны", "проверяйте ссылки", "сложные пароли",
-    "надежные решения", "системы обнаружения", "мониторинг трафика",
-    "защитить свои данные", "потенциальных атак", "соблюдайте осторожность",
-    "базовые правила", "кибергигиен", "используйте надежн",
-    "регулярное резервное", "обучение сотрудников", "повышение осведомленности",
-    "комплексный подход", "многоуровневая защита", "своевременно устанавливайте",
-    "будьте внимательны", "не открывайте подозрительные", "проявляйте осторожность",
-]
-
-STRONG_TECH_INDICATORS = [
-    "cve-", "0day", "zero-day", "exploit", "payload", "backdoor", "trojan",
-    "ransomware", "apt28", "apt29", "lazarus", "sandworm", "fancy bear",
-    "lockbit", "blackcat", "alphv", "conti", "revil", "clop",
-    ".exe", ".dll", ".apk", ".ps1", ".bat", ".sh", ".vbs", ".msi",
-    "powershell", "mimikatz", "cobalt strike", "metasploit",
-    "c2 server", "c&c", "reverse shell", "webshell",
-    "sql injection", "sqli", "xss", "csrf", "rce", "lpe", "ssrf",
-    "buffer overflow", "heap spray", "use-after-free",
-    "smb", "rdp", "ssh", "ldap", "kerberos",
-    "lateral movement", "persistence", "exfiltration",
-    "ioc", "indicator of compromise", "yara", "sigma rule",
-]
-
-TECH_INDICATORS = [
-    "cve", "vulnerability", "exploit", "malware", "ransomware", "phishing",
-    "backdoor", "trojan", "botnet", "ddos", "apt", "threat actor",
-    "zero-day", "patch", "update", "security", "breach", "leak",
-    "hack", "attack", "compromise", "infected", "payload",
-    "windows", "linux", "android", "ios", "chrome", "firefox",
-    "microsoft", "google", "apple", "cisco", "fortinet", "palo alto",
-    "уязвимост", "вредонос", "эксплойт", "фишинг", "хакер", "взлом",
-    "утечк", "атак", "патч", "брешь", "малвар", "ботнет",
 ]
 
 
@@ -312,48 +408,189 @@ def passes_local_filters(title: str, text: str) -> bool:
     return True
 
 
-def is_too_generic(text: str) -> bool:
-    """Проверка русского поста на банальности"""
+def count_specific_indicators(text: str) -> int:
+    """Подсчет конкретных технических индикаторов в тексте"""
+    count = 0
     text_lower = text.lower()
     
+    for pattern in SPECIFIC_INDICATORS:
+        matches = re.findall(pattern, text_lower, re.IGNORECASE)
+        count += len(matches)
+    
+    # Дополнительно считаем сильные индикаторы
+    for indicator in STRONG_TECH_INDICATORS:
+        if indicator in text_lower:
+            count += 2  # Сильные индикаторы весят больше
+    
+    return count
+
+
+def has_banned_advice(text: str) -> tuple[bool, list]:
+    """Проверяет наличие банальных советов и возвращает найденные"""
+    text_lower = text.lower()
+    found = []
+    
+    # Проверяем по точным фразам
+    for phrase in BANNED_PHRASES:
+        if phrase in text_lower:
+            found.append(phrase)
+    
+    # Проверяем по паттернам
+    for pattern in BANNED_ADVICE_PATTERNS:
+        matches = re.findall(pattern, text_lower)
+        found.extend(matches)
+    
+    return len(found) > 0, list(set(found))
+
+
+def extract_advice_section(text: str) -> str:
+    """Извлекает раздел 'Что делать' из поста"""
+    # Ищем раздел с рекомендациями
+    patterns = [
+        r'👇\s*Что делать[:：]?(.*?)(?:\n\n|$)',
+        r'👇\s*Рекомендации[:：]?(.*?)(?:\n\n|$)',
+        r'🔧\s*Что делать[:：]?(.*?)(?:\n\n|$)',
+        r'✅\s*Рекомендации[:：]?(.*?)(?:\n\n|$)',
+        r'📌\s*Меры[:：]?(.*?)(?:\n\n|$)',
+        r'•\s*\[?Конкретное действие\]?',  # Если AI не справился
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    
+    # Если не нашли явный раздел, ищем список в конце
+    lines = text.split('\n')
+    advice_lines = []
+    in_advice = False
+    
+    for line in reversed(lines):
+        if '•' in line or '-' in line or '*' in line:
+            advice_lines.insert(0, line)
+            in_advice = True
+        elif in_advice:
+            break
+    
+    return '\n'.join(advice_lines)
+
+
+def is_too_generic(text: str) -> bool:
+    """Усиленная проверка на банальности"""
+    text_lower = text.lower()
+    
+    # Подсчет банальных фраз
     banned_count = sum(1 for phrase in BANNED_PHRASES if phrase in text_lower)
+    
+    # Проверка паттернов банальных советов
+    has_banned_patterns, banned_found = has_banned_advice(text)
+    
+    # Подсчет конкретики
+    specific_count = count_specific_indicators(text)
+    strong_tech = sum(1 for t in STRONG_TECH_INDICATORS if t in text_lower)
+    
+    # Проверяем раздел "Что делать" отдельно
+    advice_section = extract_advice_section(text)
+    advice_has_banality, advice_banned = has_banned_advice(advice_section) if advice_section else (False, [])
+    
+    # Логирование для отладки
+    logger.info(f"   📊 Analysis: {banned_count} banned phrases, {specific_count} specifics, {strong_tech} strong tech")
+    if advice_section:
+        logger.info(f"   📋 Advice section: {len(advice_section)} chars, banalities: {len(advice_banned)}")
+    
+    # === ПРАВИЛА ОТКЛОНЕНИЯ ===
+    
+    # 1. Слишком много банальных фраз
     if banned_count >= 2:
         logger.info(f"⚠️ Too many generic phrases: {banned_count}")
         return True
     
-    strong_tech = sum(1 for t in STRONG_TECH_INDICATORS if t in text_lower)
+    # 2. Раздел "Что делать" полностью банальный
+    if advice_section and advice_has_banality and len(advice_banned) >= 1:
+        # Проверяем, есть ли в совете хоть что-то конкретное
+        advice_specifics = count_specific_indicators(advice_section)
+        if advice_specifics < 2:
+            logger.info(f"⚠️ Advice section is generic: {advice_banned}")
+            return True
     
-    has_version = bool(re.search(r'\d+\.\d+\.\d+', text))
-    has_cve = bool(re.search(r'CVE-\d{4}-\d+', text, re.I))
-    has_port = bool(re.search(r'порт\s*\d+', text_lower))
-    has_ip = bool(re.search(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', text))
-    has_path = bool(re.search(r'[A-Z]:\\|/etc/|/var/|/tmp/|/usr/', text))
-    has_command = bool(re.search(r'(sudo|chmod|chown|netsh|reg add|powershell|cmd|curl|wget)', text_lower))
-    has_hash = bool(re.search(r'\b[a-f0-9]{32,64}\b', text_lower))
-    has_domain = bool(re.search(r'\[?\.\]?(com|net|org|ru|io)\b', text_lower))
-    
-    specifics_count = sum([has_version, has_cve, has_port, has_ip, has_path, has_command, has_hash, has_domain])
-    
-    if specifics_count == 0 and strong_tech < 1:
+    # 3. Нет конкретики вообще
+    if specific_count == 0 and strong_tech < 1:
         logger.info(f"⚠️ No specifics, no strong tech")
         return True
     
-    if banned_count >= 1 and specifics_count == 0 and strong_tech < 2:
-        logger.info(f"⚠️ Generic + no specifics")
-        return True
-    
+    # 4. Мало технических терминов
     tech_count = sum(1 for term in TECH_INDICATORS if term in text_lower)
     if tech_count < 2:
         logger.info(f"⚠️ Few tech terms: {tech_count}/2")
         return True
     
+    # 5. Слишком короткий текст
     words = re.sub(r'[^\w\s]', '', text).split()
     if len(words) < 25:
         logger.info(f"⚠️ Too short: {len(words)} words")
         return True
     
-    logger.info(f"✅ Quality OK: {specifics_count} specifics, {strong_tech} strong")
+    # 6. Банальность + отсутствие конкретики
+    if banned_count >= 1 and specific_count < 2 and strong_tech < 2:
+        logger.info(f"⚠️ Generic + no specifics")
+        return True
+    
+    logger.info(f"✅ Quality OK: {specific_count} specifics, {strong_tech} strong, {banned_count} banned")
     return False
+
+
+def clean_banal_advice(text: str) -> str:
+    """Пытается очистить текст от банальных советов, сохраняя полезное"""
+    lines = text.split('\n')
+    cleaned_lines = []
+    removed_count = 0
+    
+    for line in lines:
+        line_lower = line.lower()
+        
+        # Пропускаем банальные строки
+        is_banal = False
+        
+        # Проверяем по точным фразам
+        for phrase in BANNED_PHRASES:
+            if phrase in line_lower:
+                is_banal = True
+                break
+        
+        # Проверяем по паттернам
+        if not is_banal:
+            for pattern in BANNED_ADVICE_PATTERNS:
+                if re.search(pattern, line_lower):
+                    is_banal = True
+                    break
+        
+        # Проверяем маркерные фразы без конкретики
+        if not is_banal:
+            vague_markers = [
+                r'^\s*[•\-\*]\s*обновите',
+                r'^\s*[•\-\*]\s*используйте\s+антивирус',
+                r'^\s*[•\-\*]\s*будьте\s+(осторожны|бдительны)',
+                r'^\s*[•\-\*]\s*проверяйте\s+ссылки',
+                r'^\s*[•\-\*]\s*не\s+открывайте',
+                r'^\s*[•\-\*]\s*делайте\s+резервные',
+                r'^\s*[•\-\*]\s*включите\s+двухфакторную',
+                r'^\s*[•\-\*]\s*используйте\s+(vpn|менеджер)',
+            ]
+            for marker in vague_markers:
+                if re.search(marker, line_lower):
+                    is_banal = True
+                    break
+        
+        if is_banal:
+            removed_count += 1
+            logger.info(f"   🗑️ Removed banal line: {line[:50]}...")
+        else:
+            cleaned_lines.append(line)
+    
+    if removed_count > 0:
+        logger.info(f"   🧹 Cleaned {removed_count} banal lines")
+    
+    return '\n'.join(cleaned_lines)
 
 
 # ============ СИСТЕМА ПРОВЕРКИ ДУБЛИКАТОВ ============
@@ -361,9 +598,7 @@ def is_too_generic(text: str) -> bool:
 def normalize_title(title: str) -> str:
     """Нормализация заголовка для сравнения"""
     title = title.lower()
-    # Убираем всё кроме букв и цифр
     title = re.sub(r'[^\w\s]', '', title)
-    # Убираем стоп-слова
     stop = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'in', 'on', 'at', 'to', 'for', 'of', 'and', 'or', 'new', 'how'}
     words = [w for w in title.split() if w not in stop and len(w) > 2]
     return ' '.join(words)
@@ -373,15 +608,12 @@ def extract_key_entities(text: str) -> set:
     """Извлекаем ключевые сущности из текста"""
     entities = set()
     
-    # CVE номера
     cves = re.findall(r'CVE-\d{4}-\d+', text, re.I)
     entities.update(cve.upper() for cve in cves)
     
-    # Названия малвари/групп (с большой буквы)
     malware_names = re.findall(r'\b([A-Z][a-z]+(?:Bot|Locker|Ware|Lock|Cat|Bear|Worm)?)\b', text)
     entities.update(m.lower() for m in malware_names if len(m) > 3)
     
-    # Известные группы/малварь
     known = [
         'lockbit', 'blackcat', 'alphv', 'clop', 'revil', 'conti', 'darkside',
         'lazarus', 'apt28', 'apt29', 'sandworm', 'fancy bear', 'cozy bear',
@@ -393,7 +625,6 @@ def extract_key_entities(text: str) -> set:
         if k in text_lower:
             entities.add(k)
     
-    # Компании/продукты
     companies = ['microsoft', 'google', 'apple', 'cisco', 'fortinet', 'palo alto',
                  'vmware', 'citrix', 'adobe', 'oracle', 'sap', 'salesforce',
                  'chrome', 'firefox', 'edge', 'windows', 'linux', 'android', 'ios']
@@ -407,12 +638,10 @@ def extract_key_entities(text: str) -> set:
 def calculate_similarity(title1: str, text1: str, title2: str, text2: str) -> float:
     """Комплексная проверка схожести двух новостей"""
     
-    # 1. Схожесть заголовков (нормализованных)
     norm1 = normalize_title(title1)
     norm2 = normalize_title(title2)
     title_sim = SequenceMatcher(None, norm1, norm2).ratio()
     
-    # 2. Пересечение ключевых сущностей
     entities1 = extract_key_entities(title1 + " " + text1)
     entities2 = extract_key_entities(title2 + " " + text2)
     
@@ -421,7 +650,6 @@ def calculate_similarity(title1: str, text1: str, title2: str, text2: str) -> fl
         union = entities1 | entities2
         entity_sim = len(intersection) / len(union) if union else 0
         
-        # Если совпадают CVE — это точно дубль
         cve1 = {e for e in entities1 if e.startswith('CVE-')}
         cve2 = {e for e in entities2 if e.startswith('CVE-')}
         if cve1 and cve2 and cve1 & cve2:
@@ -430,10 +658,8 @@ def calculate_similarity(title1: str, text1: str, title2: str, text2: str) -> fl
     else:
         entity_sim = 0
     
-    # 3. Схожесть текста (первые 500 символов)
     text_sim = SequenceMatcher(None, text1[:500].lower(), text2[:500].lower()).ratio()
     
-    # Взвешенная оценка
     final_score = (title_sim * 0.5) + (entity_sim * 0.35) + (text_sim * 0.15)
     
     return final_score
@@ -444,7 +670,7 @@ class State:
         self.data = {
             "posted_ids": {},
             "recent_titles": [],
-            "recent_posts": []  # Новое: храним заголовок + текст
+            "recent_posts": []
         }
         self._load()
     
@@ -454,7 +680,6 @@ class State:
                 with open(STATE_FILE, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
                     self.data.update(loaded)
-                    # Миграция: если нет recent_posts
                     if "recent_posts" not in self.data:
                         self.data["recent_posts"] = []
             except:
@@ -476,9 +701,6 @@ class State:
         return uid in self.data["posted_ids"]
     
     def is_duplicate(self, title: str, text: str) -> bool:
-        """Проверка на дубликат с учётом контента"""
-        
-        # 1. Быстрая проверка по заголовкам
         norm_new = normalize_title(title)
         for old_title in self.data["recent_titles"][-30:]:
             norm_old = normalize_title(old_title)
@@ -486,7 +708,6 @@ class State:
                 logger.info(f"🔄 Title duplicate: {title[:50]}...")
                 return True
         
-        # 2. Глубокая проверка с контентом
         for old_post in self.data["recent_posts"][-20:]:
             old_title = old_post.get("title", "")
             old_text = old_post.get("text", "")
@@ -500,7 +721,6 @@ class State:
         return False
     
     def mark_posted(self, uid: str, title: str, text: str = ""):
-        # Ограничиваем размер posted_ids
         if len(self.data["posted_ids"]) > MAX_POSTED_IDS:
             self.data["posted_ids"] = dict(sorted(
                 self.data["posted_ids"].items(),
@@ -509,15 +729,13 @@ class State:
         
         self.data["posted_ids"][uid] = int(time.time())
         
-        # Сохраняем заголовки
         self.data["recent_titles"].append(title)
         if len(self.data["recent_titles"]) > 50:
             self.data["recent_titles"] = self.data["recent_titles"][-50:]
         
-        # Сохраняем заголовок + текст для глубокой проверки
         self.data["recent_posts"].append({
             "title": title,
-            "text": text[:1000],  # Первые 1000 символов
+            "text": text[:1000],
             "time": int(time.time())
         })
         if len(self.data["recent_posts"]) > 30:
@@ -586,7 +804,7 @@ async def fetch_full_article(url: str, session: aiohttp.ClientSession) -> str:
         return ""
 
 
-# ============ ГЕНЕРАЦИЯ ПОСТА ============
+# ============ УЛУЧШЕННАЯ ГЕНЕРАЦИЯ ПОСТА ============
 
 async def generate_post(item, session: aiohttp.ClientSession) -> Optional[str]:
     full_text = item.text
@@ -596,6 +814,7 @@ async def generate_post(item, session: aiohttp.ClientSession) -> Optional[str]:
             full_text = item.text + " " + extra
             logger.info(f"   📄 +{len(extra)} chars")
     
+    # УСИЛЕННЫЙ ПРОМПТ с примерами
     prompt = f"""You are an editor for a Russian-language Telegram channel about cybersecurity (30k+ subscribers).
 
 SOURCE (English):
@@ -604,20 +823,33 @@ Text: {full_text[:3500]}
 
 TASK: Write a post in RUSSIAN with SPECIFIC technical details.
 
-RULES:
-❌ NO generic advice: "update software", "use antivirus", "be careful", "strong passwords"
-✅ INCLUDE: CVE numbers, software versions, malware names, file paths, ports, commands, IOCs
+=== CRITICAL RULES ===
+❌ FORBIDDEN (will be rejected):
+• "Обновите сигнатуры антивируса" — TOO GENERIC, will be rejected
+• "Используйте антивирус" — TOO GENERIC, will be rejected  
+• "Обновитесь до последней версии" — TOO VAGUE, will be rejected
+• "Будьте бдительны" — EMPTY PHRASE, will be rejected
+• "Проверяйте ссылки" — TOO OBVIOUS, will be rejected
+• "Используйте сложные пароли" — BANNED, will be rejected
+• "Включите 2FA" — BANNED, will be rejected
+• "Делайте резервные копии" — BANNED without specifics
 
-📌 If source lacks details - write SHORT post (3-4 sentences) about what happened. NO padding.
-📌 If NOT about security - respond: SKIP
+✅ GOOD EXAMPLES (what to write):
+• "Заблокируйте исходящие соединения на порт 445 для сегментов с ICS"
+• "Проверьте наличие файла C:\\Windows\\Temp\\update.exe с хэшем SHA256: a1b2c3..."
+• "Отключите SMBv1 через GPO: Computer Configuration > Policies > Windows Settings > Security Settings"
+• "Добавьте IOC в блоклист: домен malicious-c2.com, IP 185.220.101.42"
+• "Примените временный патч: Set-ItemProperty -Path 'HKLM:\\...' -Name 'Disable...' -Value 1"
+• "Проверьте логи на наличие события Event ID 4624 с LogonType 10 из подсети 10.0.0.0/8"
 
-FORMAT (Russian):
-🔥 [Конкретный заголовок]
+=== FORMAT ===
+🔥 [Конкретный заголовок с CVE/названием малвари]
 
-[2-4 предложения с техническими деталями]
+[2-4 предложения с техническими деталями: версии, порты, пути, хэши, команды]
 
 👇 Что делать:
-• [Конкретное действие]
+• [Конкретное действие с техническими деталями]
+• [Еще одно конкретное действие]
 
 Write in RUSSIAN or SKIP:"""
 
@@ -635,9 +867,23 @@ Write in RUSSIAN or SKIP:"""
         logger.info(f"⏩ Too short: {len(text)}")
         return None
     
+    # Проверка на банальности
     if is_too_generic(text):
-        logger.info("⏩ Too generic")
-        return None
+        # Пробуем очистить от банальностей
+        cleaned = clean_banal_advice(text)
+        
+        # Если после очистки осталось мало — отклоняем
+        if len(cleaned) < len(text) * 0.7:
+            logger.info(f"⏩ Too generic even after cleaning")
+            return None
+        
+        # Проверяем, остались ли банальности
+        if is_too_generic(cleaned):
+            logger.info("⏩ Still too generic after cleaning")
+            return None
+        
+        text = cleaned
+        logger.info("🧹 Post cleaned from banalities")
     
     return text + f"\n\n🔗 <a href='{item.link}'>Источник</a>"
 
@@ -774,7 +1020,7 @@ def clean_text(text: str) -> str:
 # ============ MAIN ============
 
 async def main():
-    logger.info("🚀 Starting KiberSOS")
+    logger.info("🚀 Starting KiberSOS (Enhanced Anti-Banality)")
     
     async with aiohttp.ClientSession() as session:
         logger.info("📡 Fetching sources...")
@@ -815,7 +1061,6 @@ async def main():
             attempts += 1
             logger.info(f"🔍 [{attempts}/{MAX_ATTEMPTS}] {item.source}: {item.title[:50]}...")
             
-            # Проверка дубликатов (УСИЛЕННАЯ)
             if state.is_duplicate(item.title, item.text):
                 state.mark_posted(item.uid, item.title, item.text)
                 duplicates_skipped += 1
@@ -875,3 +1120,4 @@ if __name__ == "__main__":
     ]
     
     asyncio.run(main())
+
