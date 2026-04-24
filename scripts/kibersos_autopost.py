@@ -48,7 +48,7 @@ CACHE_DIR = os.getenv("CACHE_DIR", "cache_sec")
 os.makedirs(CACHE_DIR, exist_ok=True)
 STATE_FILE = os.path.join(CACHE_DIR, "state_groq_v2.json")
 
-TEXT_ONLY_THRESHOLD = 3000          # было 700
+TEXT_ONLY_THRESHOLD = 3000
 MAX_POSTED_IDS = 500
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=25)
 IMAGE_TIMEOUT = aiohttp.ClientTimeout(total=40)
@@ -146,7 +146,6 @@ budget = GroqBudget()
 
 # ============ РАСШИРЕННЫЙ СПИСОК БАНАЛЬНОСТЕЙ ============
 BANNED_PHRASES = [
-    # Базовые
     "из доверенных источников", "регулярно обновляйте", "будьте бдительны",
     "используйте антивирус", "надёжный пароль", "надежный пароль",
     "будьте осторожны", "проверяйте ссылки", "сложные пароли",
@@ -155,26 +154,19 @@ BANNED_PHRASES = [
     "регулярное резервное", "обучение сотрудников", "повышение осведомленности",
     "комплексный подход", "многоуровневая защита", "своевременно устанавливайте",
     "будьте внимательны", "не открывайте подозрительные", "проявляйте осторожность",
-    # Антивирус
     "обновить сигнатуры", "обновите сигнатуры", "обновление сигнатур",
     "антивирусное ПО", "антивирус", "антивируса", "антивирусные",
     "включить детекцию", "включите детекцию", "включить обнаружение",
     "сканировать систему", "провести сканирование", "полное сканирование",
-    # Общие
     "рекомендуется обновить", "следует обновить", "необходимо обновить",
     "выпустила исправление", "выпустила патч", "выпустила обновление",
     "установите последнее обновление", "обновитесь до последней версии",
     "своевременно устанавливайте обновления", "не откладывайте обновления",
     "принять меры", "предпринять шаги", "обеспечить безопасность",
-    # Резервное копирование
     "делайте резервные копии", "создавайте бэкапы", "резервное копирование",
-    # MFA/2FA
     "включите двухфакторную аутентификацию", "включите 2fa", "используйте двухфакторную",
-    # Сеть
     "используйте vpn", "подключайтесь через vpn", "настройте firewall",
-    # Пароли
     "меняйте пароли", "используйте уникальные пароли", "парольный менеджер",
-    # Дополнительные (новые)
     "регулярно обновляйте программное обеспечение", "используйте лицензионное ПО",
     "не скачивайте файлы из непроверенных источников", "проверяйте цифровые подписи",
     "настройте брандмауэр", "ограничьте права пользователей", "применяйте принцип наименьших привилегий",
@@ -354,7 +346,6 @@ def clean_banal_advice(text: str) -> str:
     return '\n'.join(cleaned)
 
 def post_quality_score(text: str) -> float:
-    """0..1, 1 - максимально технический пост"""
     score = 0.0
     cves = re.findall(r'CVE-\d{4}-\d+', text, re.I)
     score += min(len(cves) * 0.2, 0.6)
@@ -383,6 +374,26 @@ def smart_trim(text: str, max_len: int) -> str:
             end = pos + (len(sep) if sep != ' ' else 0)
             return text[:end].strip()
     return text[:max_len].rsplit(' ', 1)[0].strip()
+
+# ============ НОВАЯ ФУНКЦИЯ ДЛЯ УДАЛЕНИЯ ЗАГОЛОВКОВ БЛОКОВ ============
+def remove_block_labels(text: str) -> str:
+    """Удаляет строки, которые начинаются с **БЛОК N:** или [БЛОК N — ...]"""
+    lines = text.split('\n')
+    cleaned = []
+    for line in lines:
+        # Убираем строки, где есть маркер блока с цифрой
+        if re.search(r'^\s*(\*\*)?\s*БЛОК\s+\d+\s*[:—\-]', line, re.IGNORECASE):
+            continue
+        # Убираем строки, где внутри текста встречается [БЛОК 1 — ...] как отдельный заголовок
+        if re.search(r'\[\s*БЛОК\s+\d+\s*[:—\-]', line, re.IGNORECASE):
+            continue
+        cleaned.append(line)
+    # Дополнительно удаляем одиночные маркеры "БЛОК X:" которые могли остаться внутри строк
+    cleaned_text = '\n'.join(cleaned)
+    cleaned_text = re.sub(r'\*\*БЛОК\s+\d+\s*[:—\-][^*]*\*\*', '', cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r'БЛОК\s+\d+\s*[:—\-]', '', cleaned_text, flags=re.IGNORECASE)
+    # Убираем пустые строки в начале/конце
+    return cleaned_text.strip()
 
 # ============ СОСТОЯНИЕ И ДУБЛИКАТЫ ============
 def normalize_title(title: str) -> str:
@@ -486,17 +497,14 @@ class State:
     
     def is_duplicate(self, title: str, text: str) -> bool:
         norm_new = normalize_title(title)
-        # по заголовкам
         for old_title in self.data["recent_titles"][-30:]:
             if SequenceMatcher(None, norm_new, normalize_title(old_title)).ratio() > 0.65:
                 return True
-        # по CVE
         cve_new = set(re.findall(r'CVE-\d{4}-\d+', text, re.I))
         for old in self.data["recent_posts"][-20:]:
             cve_old = set(re.findall(r'CVE-\d{4}-\d+', old.get("text",""), re.I))
             if cve_new & cve_old:
                 return True
-        # по контенту
         for old in self.data["recent_posts"][-20:]:
             if calculate_similarity(title, text, old.get("title",""), old.get("text","")) > 0.5:
                 return True
@@ -613,7 +621,7 @@ async def fetch_full_article(url: str, session: aiohttp.ClientSession) -> str:
     except:
         return ""
 
-# ============ ГЕНЕРАЦИЯ ПОСТА (НОВЫЙ ПРОМПТ) ============
+# ============ ГЕНЕРАЦИЯ ПОСТА (ИСПРАВЛЕННЫЙ ПРОМПТ) ============
 async def generate_post(item, session: aiohttp.ClientSession) -> Optional[str]:
     full_text = item.text
     if len(item.text) < 500:
@@ -642,32 +650,28 @@ TASK: Write a detailed post in RUSSIAN. Target length: 2500–3800 characters (T
 • Любой совет без конкретного инструмента, команды, пути, порта или хэша
 
 ════════════════════════════════════
-✅ ФОРМАТ ПОСТА (строго соблюдать):
+✅ ФОРМАТ ПОСТА (строго соблюдать, НЕ ПИСАТЬ слова "БЛОК 1:", "БЛОК 2:" и т.п.):
 ════════════════════════════════════
 
 🔥 [Заголовок: название CVE или малвари + суть угрозы, макс. 80 символов]
 
-[БЛОК 1 — ЧТО ПРОИЗОШЛО: 3–5 предложений]
+[Опишите ЧТО ПРОИЗОШЛО: 3–5 предложений]
 Конкретика: кто атакует, какой вектор, какие системы затронуты, масштаб.
 Примеры хорошего стиля:
   «Группа Lazarus эксплуатирует CVE-2024-21338 (CVSS 8.8) в драйвере appid.sys Windows — позволяет повысить привилегии до SYSTEM через гонку условий в функции NtQuerySystemInformation.»
   «LockBit 3.0 распространяется через брутфорс RDP (порт 3389) и фишинговые .lnk-файлы, маскированные под PDF. После закрепления — выгружает EDR через Process Hollowing в explorer.exe.»
 
-[БЛОК 2 — КАК РАБОТАЕТ АТАКА: 3–5 предложений]
+[Опишите КАК РАБОТАЕТ АТАКА: 3–5 предложений]
 Технический разбор механизма. Цепочка: начальный вектор → закрепление → действия.
 Упоминайте: конкретные техники (MITRE ATT&CK если уместно), инструменты (Cobalt Strike, Mimikatz и т.д.), порты, пути реестра, процессы, Event ID.
-Примеры:
-  «Эксплойт записывает шеллкод по адресу 0x7ffe0300, обходя KASLR через утечку адреса ядра из EPROCESS.»
-  «После запуска PowerShell-загрузчик скачивает второй стейдж с C2 185.220.101.42:8443, сохраняет в %APPDATA%\\Microsoft\\Windows\\svchost32.exe и прописывается в HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run.»
 
-[БЛОК 3 — IOC / ТЕХНИЧЕСКИЕ ДЕТАЛИ: список]
-Если есть — обязательно включить:
+[IOC / ТЕХНИЧЕСКИЕ ДЕТАЛИ: список, если есть]
   • Хэши файлов (MD5/SHA256)
   • IP/домены C2
   • Пути файлов или ключи реестра
   • User-Agent или сетевые сигнатуры
 
-[БЛОК 4 — ЧТО ДЕЛАТЬ: минимум 4 пункта с техническими деталями]
+[ЧТО ДЕЛАТЬ: минимум 4 пункта с техническими деталями]
 Каждый пункт — конкретное действие с инструментом/командой/путём.
 НЕ «обновите», а КАК обновить и ЧТО именно.
 НЕ «проверьте логи», а какой Event ID, в каком журнале, какой фильтр.
@@ -677,14 +681,11 @@ TASK: Write a detailed post in RUSSIAN. Target length: 2500–3800 characters (T
   • Проверьте Event ID 4688 (создание процесса) в Security.evtx на наличие цепочки: wscript.exe → powershell.exe с параметром -enc или -nop — признак загрузчика
   • Добавьте в SIEM/EDR правило: процесс с именем svchost32.exe (обратите внимание — не svchost.exe) = немедленный алерт
   • Если используете Microsoft Defender: Get-MpThreat | Where-Object {{$_.ThreatName -like '*Lazarus*'}} — проверка активных детектов
-  • Для Splunk: index=wineventlog EventCode=4624 LogonType=10 | where src_ip!="10.0.0.0/8" — детект нелегитимного RDP
-  • Временное смягчение до патча: reg add "HKLM\\SYSTEM\\CurrentControlSet\\Services\\AppID" /v Start /t REG_DWORD /d 4 /f — отключение уязвимого сервиса
-  • Для Linux: grep -r 'svchost32\|185\.220\.101' /var/log/syslog /var/log/auth.log — поиск IOC в логах
-  • Используйте YARA-правило: strings: $a = "NtQuerySystemInformation" $b = {{48 8B 05 ?? ?? ?? ??}} condition: all of them — для поиска на хостах
 
 ════════════════════════════════════
 ДОПОЛНИТЕЛЬНЫЕ ПРАВИЛА:
 ════════════════════════════════════
+• НИКОГДА не пишите слова "БЛОК 1:", "БЛОК 2:", "БЛОК 3:", "БЛОК 4:" и т.п. — они не нужны.
 • Если есть CVE — всегда указывай CVSS score и affected versions
 • Если нет IOC — пиши «IOC на момент публикации не раскрыты, следим за обновлениями»
 • Пиши уверенно, без воды. Каждое предложение несёт ценность.
@@ -696,11 +697,14 @@ TASK: Write a detailed post in RUSSIAN. Target length: 2500–3800 characters (T
 Пиши на русском:"""
 
     model_choice = "heavy" if len(full_text) > 1500 else "light"
-    max_tokens = 3200  # для получения 3500-4000 символов
+    max_tokens = 3200
     text, _ = await call_groq_with_retry(prompt, model_choice, max_tokens, retries=2)
     
     if not text:
         return None
+    
+    # Удаляем возможные заголовки блоков
+    text = remove_block_labels(text)
     
     text_clean = text.strip()
     if text_clean.upper() == "SKIP" or text_clean.upper().startswith("SKIP"):
@@ -711,7 +715,6 @@ TASK: Write a detailed post in RUSSIAN. Target length: 2500–3800 characters (T
         logger.info(f"⏩ Too short: {len(text)}")
         return None
     
-    # Удаление банальностей
     if is_too_generic(text):
         cleaned = clean_banal_advice(text)
         if len(cleaned) < len(text) * 0.7 or is_too_generic(cleaned):
@@ -720,14 +723,12 @@ TASK: Write a detailed post in RUSSIAN. Target length: 2500–3800 characters (T
         text = cleaned
         logger.info("🧹 Cleaned from banalities")
     
-    # Оценка качества
     quality = post_quality_score(text)
     if quality < 0.4:
         logger.info(f"⏩ Low quality score: {quality:.2f}")
         return None
     logger.info(f"📊 Quality score: {quality:.2f}")
     
-    # Добавление ссылки и обрезка до лимита Telegram
     source_suffix = f"\n\n🔗 <a href='{item.link}'>Источник</a>"
     max_len = 4096 - len(source_suffix)
     if len(text) > max_len:
@@ -855,7 +856,6 @@ async def main():
             await bot.session.close()
             return
         
-        # Разнообразие тем
         dominant = state.needs_diversity()
         if dominant:
             other = [i for i in all_items if detect_topic(i.title, i.text) != dominant]
