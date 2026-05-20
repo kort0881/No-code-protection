@@ -20,7 +20,6 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import FSInputFile
 from groq import Groq
 
 # ============ ЛОГИРОВАНИЕ ============
@@ -48,10 +47,10 @@ CACHE_DIR = os.getenv("CACHE_DIR", "cache_sec")
 os.makedirs(CACHE_DIR, exist_ok=True)
 STATE_FILE = os.path.join(CACHE_DIR, "state_groq_v2.json")
 
-TEXT_ONLY_THRESHOLD = 3000
+# Убираем порог для картинок — больше не нужен
+TEXT_ONLY_THRESHOLD = 1000000  # огромное число, чтобы всегда было только текст
 MAX_POSTED_IDS = 500
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=25)
-IMAGE_TIMEOUT = aiohttp.ClientTimeout(total=40)
 
 RECENT_POSTS_CHECK = 10
 RECENT_SIMILARITY_THRESHOLD = 0.40
@@ -375,24 +374,19 @@ def smart_trim(text: str, max_len: int) -> str:
             return text[:end].strip()
     return text[:max_len].rsplit(' ', 1)[0].strip()
 
-# ============ НОВАЯ ФУНКЦИЯ ДЛЯ УДАЛЕНИЯ ЗАГОЛОВКОВ БЛОКОВ ============
 def remove_block_labels(text: str) -> str:
     """Удаляет строки, которые начинаются с **БЛОК N:** или [БЛОК N — ...]"""
     lines = text.split('\n')
     cleaned = []
     for line in lines:
-        # Убираем строки, где есть маркер блока с цифрой
         if re.search(r'^\s*(\*\*)?\s*БЛОК\s+\d+\s*[:—\-]', line, re.IGNORECASE):
             continue
-        # Убираем строки, где внутри текста встречается [БЛОК 1 — ...] как отдельный заголовок
         if re.search(r'\[\s*БЛОК\s+\d+\s*[:—\-]', line, re.IGNORECASE):
             continue
         cleaned.append(line)
-    # Дополнительно удаляем одиночные маркеры "БЛОК X:" которые могли остаться внутри строк
     cleaned_text = '\n'.join(cleaned)
     cleaned_text = re.sub(r'\*\*БЛОК\s+\d+\s*[:—\-][^*]*\*\*', '', cleaned_text, flags=re.IGNORECASE)
     cleaned_text = re.sub(r'БЛОК\s+\d+\s*[:—\-]', '', cleaned_text, flags=re.IGNORECASE)
-    # Убираем пустые строки в начале/конце
     return cleaned_text.strip()
 
 # ============ СОСТОЯНИЕ И ДУБЛИКАТЫ ============
@@ -621,7 +615,7 @@ async def fetch_full_article(url: str, session: aiohttp.ClientSession) -> str:
     except:
         return ""
 
-# ============ ГЕНЕРАЦИЯ ПОСТА (ИСПРАВЛЕННЫЙ ПРОМПТ) ============
+# ============ ГЕНЕРАЦИЯ ПОСТА ============
 async def generate_post(item, session: aiohttp.ClientSession) -> Optional[str]:
     full_text = item.text
     if len(item.text) < 500:
@@ -703,7 +697,6 @@ TASK: Write a detailed post in RUSSIAN. Target length: 2500–3800 characters (T
     if not text:
         return None
     
-    # Удаляем возможные заголовки блоков
     text = remove_block_labels(text)
     
     text_clean = text.strip()
@@ -736,27 +729,6 @@ TASK: Write a detailed post in RUSSIAN. Target length: 2500–3800 characters (T
         logger.info(f"✂️ Trimmed to {len(text)} chars")
     
     return text + source_suffix
-
-# ============ ИЗОБРАЖЕНИЯ ============
-async def generate_image(title: str, session: aiohttp.ClientSession) -> Optional[str]:
-    try:
-        styles = ["cyberpunk neon", "matrix code rain", "hacker aesthetic", "dark tech noir"]
-        clean_t = re.sub(r'[^a-zA-Z0-9\s]', '', title)[:35]
-        prompt = f"hacker silhouette computer, {clean_t}, {random.choice(styles)}, dark background, cinematic"
-        encoded = urllib.parse.quote(prompt)
-        url = f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=720&nologo=true&seed={random.randint(0, 99999)}"
-        async with session.get(url, timeout=IMAGE_TIMEOUT) as resp:
-            if resp.status == 200:
-                data = await resp.read()
-                if len(data) > 5000:
-                    path = os.path.join(CACHE_DIR, f"img_{int(time.time())}.jpg")
-                    with open(path, "wb") as f:
-                        f.write(data)
-                    logger.info(f"   🖼 Image: {len(data)//1024}KB")
-                    return path
-    except:
-        pass
-    return None
 
 # ============ КЛАССЫ ДАННЫХ ============
 @dataclass
@@ -840,9 +812,9 @@ def clean_text(text: str) -> str:
     text = html.unescape(text)
     return re.sub(r'\s+', ' ', text).strip()
 
-# ============ ОСНОВНОЙ ЦИКЛ ============
+# ============ ОСНОВНОЙ ЦИКЛ (БЕЗ КАРТИНОК) ============
 async def main():
-    logger.info("🚀 Starting KiberSOS v3.0 (Enhanced, long posts, no generic advice)")
+    logger.info("🚀 Starting KiberSOS v3.0 (Enhanced, long posts, no generic advice, NO IMAGES)")
     
     async with aiohttp.ClientSession() as session:
         logger.info("📡 Fetching sources...")
@@ -891,17 +863,9 @@ async def main():
                 state.mark_posted(item.uid, item.title, item.text, detect_topic(item.title, item.text))
                 continue
             
+            # ====== ОТПРАВЛЯЕМ ТОЛЬКО ТЕКСТ, БЕЗ КАРТИНОК ======
             try:
-                if len(post_text) > TEXT_ONLY_THRESHOLD:
-                    await bot.send_message(CHANNEL_ID, text=post_text)
-                else:
-                    img = await generate_image(item.title, session)
-                    if img:
-                        await bot.send_photo(CHANNEL_ID, photo=FSInputFile(img), caption=post_text)
-                        try: os.remove(img)
-                        except: pass
-                    else:
-                        await bot.send_message(CHANNEL_ID, text=post_text)
+                await bot.send_message(CHANNEL_ID, text=post_text)
                 logger.info("✅ Posted!")
                 state.mark_posted(item.uid, item.title, item.text, detect_topic(item.title, item.text))
                 posts_done += 1
