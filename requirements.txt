@@ -1,6 +1,6 @@
-aiogram
-groq
-aiohttp
-feedparser
-youtube-transcript-api
-beautifulsoup4
+aiogram>=3.0
+aiohttp>=3.9
+feedparser>=6.0
+youtube-transcript-api>=0.6
+beautifulsoup4>=4.12
+openai>=1.0.0
