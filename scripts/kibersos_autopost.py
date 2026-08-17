@@ -20,7 +20,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from groq import Groq
+from openai import AsyncOpenAI   # <--- заменили
 
 # ============ ЛОГИРОВАНИЕ ============
 logging.basicConfig(
@@ -47,8 +47,7 @@ CACHE_DIR = os.getenv("CACHE_DIR", "cache_sec")
 os.makedirs(CACHE_DIR, exist_ok=True)
 STATE_FILE = os.path.join(CACHE_DIR, "state_groq_v2.json")
 
-# Убираем порог для картинок — больше не нужен
-TEXT_ONLY_THRESHOLD = 1000000  # огромное число, чтобы всегда было только текст
+TEXT_ONLY_THRESHOLD = 1000000
 MAX_POSTED_IDS = 500
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=25)
 
@@ -56,7 +55,7 @@ RECENT_POSTS_CHECK = 10
 RECENT_SIMILARITY_THRESHOLD = 0.40
 MIN_TOPIC_DIVERSITY = 3
 
-# ============ МОДЕЛИ GROQ ============
+# ============ МОДЕЛЬ (одна, новая) ============
 @dataclass
 class ModelConfig:
     name: str
@@ -66,9 +65,13 @@ class ModelConfig:
     priority: int
 
 MODELS = {
-    "heavy": ModelConfig("llama-3.3-70b-versatile", rpm=30, tpm=6000, daily_tokens=100000, priority=1),
-    "light": ModelConfig("llama-3.1-8b-instant", rpm=30, tpm=20000, daily_tokens=500000, priority=2),
-    "fallback": ModelConfig("mixtral-8x7b-32768", rpm=30, tpm=5000, daily_tokens=100000, priority=3),
+    "main": ModelConfig(
+        name="openai/gpt-oss-120b",   # новая модель
+        rpm=30,
+        tpm=20000,
+        daily_tokens=500000,
+        priority=1
+    ),
 }
 
 class GroqBudget:
@@ -89,7 +92,7 @@ class GroqBudget:
                 with open(self.state_file, "r") as f:
                     saved = json.load(f)
                     if saved.get("last_reset") != time.strftime("%Y-%m-%d"):
-                        logger.info("🔄 New day — reset Groq limits")
+                        logger.info("🔄 New day — reset limits")
                         saved["daily_tokens"] = {}
                         saved["last_reset"] = time.strftime("%Y-%m-%d")
                     default.update(saved)
@@ -143,7 +146,13 @@ class GroqBudget:
 
 budget = GroqBudget()
 
-# ============ РАСШИРЕННЫЙ СПИСОК БАНАЛЬНОСТЕЙ ============
+# ============ СОЗДАЁМ КЛИЕНТ ============
+openai_client = AsyncOpenAI(
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1"
+)
+
+# ============ ОСТАЛЬНЫЕ ФИЛЬТРЫ (без изменений) ============
 BANNED_PHRASES = [
     "из доверенных источников", "регулярно обновляйте", "будьте бдительны",
     "используйте антивирус", "надёжный пароль", "надежный пароль",
@@ -252,7 +261,7 @@ SECURITY_KEYWORDS = [
     "apt", "threat actor", "lockbit", "blackcat", "alert", "ioc",
 ]
 
-# ============ ФИЛЬТРЫ ============
+# ============ ФИЛЬТРЫ (без изменений) ============
 def passes_local_filters(title: str, text: str) -> bool:
     content = (title + " " + text).lower()
     title_lower = title.lower()
@@ -375,7 +384,6 @@ def smart_trim(text: str, max_len: int) -> str:
     return text[:max_len].rsplit(' ', 1)[0].strip()
 
 def remove_block_labels(text: str) -> str:
-    """Удаляет строки, которые начинаются с **БЛОК N:** или [БЛОК N — ...]"""
     lines = text.split('\n')
     cleaned = []
     for line in lines:
@@ -558,39 +566,33 @@ class State:
 
 state = State()
 
-# ============ GROQ С ПОВТОРАМИ ============
-groq_client = Groq(api_key=GROQ_API_KEY)
+# ============ ВЫЗОВ OPENAI ============
+async def call_openai(prompt: str, max_tokens: int = 1500) -> tuple[str, int]:
+    model_key = "main"
+    if not budget.can_use_model(model_key):
+        logger.warning("⚠️ Budget exhausted")
+        return "", 0
+    cfg = MODELS[model_key]
+    try:
+        await budget.wait_for_rate_limit(model_key)
+        response = await openai_client.chat.completions.create(
+            model=cfg.name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=0.7
+        )
+        res = response.choices[0].message.content.strip()
+        tokens = response.usage.total_tokens if response.usage else 0
+        budget.add_tokens(cfg.name, tokens)
+        logger.info(f"✅ Model: {model_key} ({tokens} tok)")
+        return res, tokens
+    except Exception as e:
+        logger.warning(f"⚠️ OpenAI error: {e}")
+        return "", 0
 
-async def call_groq(prompt: str, model_pref: str = "heavy", max_tokens: int = 1500) -> tuple[str, int]:
-    order = ["heavy", "light", "fallback"] if model_pref == "heavy" else ["light", "fallback", "heavy"]
-    for key in order:
-        if not budget.can_use_model(key):
-            continue
-        cfg = MODELS[key]
-        try:
-            await budget.wait_for_rate_limit(key)
-            response = await asyncio.to_thread(
-                lambda: groq_client.chat.completions.create(
-                    model=cfg.name,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=max_tokens,
-                    temperature=0.7
-                )
-            )
-            res = response.choices[0].message.content.strip()
-            tokens = response.usage.total_tokens if response.usage else 0
-            budget.add_tokens(cfg.name, tokens)
-            logger.info(f"✅ Model: {key} ({tokens} tok)")
-            return res, tokens
-        except Exception as e:
-            logger.warning(f"⚠️ {key} error: {e}")
-            await asyncio.sleep(5)
-            continue
-    return "", 0
-
-async def call_groq_with_retry(prompt: str, model_pref: str, max_tokens: int, retries: int = 2) -> tuple[str, int]:
+async def call_openai_with_retry(prompt: str, max_tokens: int, retries: int = 2) -> tuple[str, int]:
     for attempt in range(retries):
-        res, tokens = await call_groq(prompt, model_pref, max_tokens)
+        res, tokens = await call_openai(prompt, max_tokens)
         if res:
             return res, tokens
         wait = 2 ** attempt * 5
@@ -690,9 +692,8 @@ TASK: Write a detailed post in RUSSIAN. Target length: 2500–3800 characters (T
 
 Пиши на русском:"""
 
-    model_choice = "heavy" if len(full_text) > 1500 else "light"
     max_tokens = 3200
-    text, _ = await call_groq_with_retry(prompt, model_choice, max_tokens, retries=2)
+    text, _ = await call_openai_with_retry(prompt, max_tokens, retries=2)
     
     if not text:
         return None
@@ -814,7 +815,7 @@ def clean_text(text: str) -> str:
 
 # ============ ОСНОВНОЙ ЦИКЛ (БЕЗ КАРТИНОК) ============
 async def main():
-    logger.info("🚀 Starting KiberSOS v3.0 (Enhanced, long posts, no generic advice, NO IMAGES)")
+    logger.info("🚀 Starting KiberSOS v3.0 (Enhanced, long posts, no generic advice, NO IMAGES) – with openai/gpt-oss-120b")
     
     async with aiohttp.ClientSession() as session:
         logger.info("📡 Fetching sources...")
@@ -845,7 +846,7 @@ async def main():
         for item in all_items:
             if posts_done >= max_posts or attempts >= max_attempts:
                 break
-            if not budget.can_use_model("light"):
+            if not budget.can_use_model("main"):
                 logger.warning("⚠️ Budget exhausted")
                 break
             attempts += 1
