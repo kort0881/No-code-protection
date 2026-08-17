@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import json
 import asyncio
@@ -20,7 +23,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from openai import AsyncOpenAI   # <--- заменили
+from openai import AsyncOpenAI
 
 # ============ ЛОГИРОВАНИЕ ============
 logging.basicConfig(
@@ -66,7 +69,7 @@ class ModelConfig:
 
 MODELS = {
     "main": ModelConfig(
-        name="openai/gpt-oss-120b",   # новая модель
+        name="openai/gpt-oss-120b",
         rpm=30,
         tpm=20000,
         daily_tokens=500000,
@@ -380,8 +383,8 @@ def smart_trim(text: str, max_len: int) -> str:
         pos = text.rfind(sep, 0, max_len)
         if pos != -1:
             end = pos + (len(sep) if sep != ' ' else 0)
-            return text[:end].strip()
-    return text[:max_len].rsplit(' ', 1)[0].strip()
+            return text[:end].strip() + '…'
+    return text[:max_len].rsplit(' ', 1)[0].strip() + '…'
 
 def remove_block_labels(text: str) -> str:
     lines = text.split('\n')
@@ -617,7 +620,7 @@ async def fetch_full_article(url: str, session: aiohttp.ClientSession) -> str:
     except:
         return ""
 
-# ============ ГЕНЕРАЦИЯ ПОСТА ============
+# ============ ГЕНЕРАЦИЯ ПОСТА (с исправленной обрезкой и ссылкой) ============
 async def generate_post(item, session: aiohttp.ClientSession) -> Optional[str]:
     full_text = item.text
     if len(item.text) < 500:
@@ -722,12 +725,23 @@ TASK: Write a detailed post in RUSSIAN. Target length: 2500–3800 characters (T
         logger.info(f"⏩ Low quality score: {quality:.2f}")
         return None
     logger.info(f"📊 Quality score: {quality:.2f}")
+
+    # ============ УДАЛЯЕМ ССЫЛКИ ИЗ ТЕКСТА, ЧТОБЫ НЕ МЕШАЛИ ============
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'<a\s+[^>]*>.*?</a>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<a\s+[^>]*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'</a>', '', text, flags=re.IGNORECASE)
     
     source_suffix = f"\n\n🔗 <a href='{item.link}'>Источник</a>"
-    max_len = 4096 - len(source_suffix)
+    max_len = 4096 - len(source_suffix) - 5  # запас 5 символов
+    
     if len(text) > max_len:
         text = smart_trim(text, max_len)
         logger.info(f"✂️ Trimmed to {len(text)} chars")
+        # Если всё ещё длиннее, обрезаем жёстко
+        if len(text) > max_len:
+            text = text[:max_len].rsplit(' ', 1)[0] + '…'
+            logger.info(f"✂️ Hard trimmed to {len(text)} chars")
     
     return text + source_suffix
 
