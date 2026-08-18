@@ -376,15 +376,47 @@ def post_quality_score(text: str) -> float:
         score += 0.1
     return min(score, 1.0)
 
+# ============ ИСПРАВЛЕННАЯ ФУНКЦИЯ SMART_TRIM ============
 def smart_trim(text: str, max_len: int) -> str:
+    """Обрезает текст до max_len, стараясь завершить на границе предложения или абзаца."""
     if len(text) <= max_len:
         return text
-    for sep in ['. ', '! ', '? ', '\n\n', '\n', ' ']:
+
+    # 1. Ищем конец предложения (точка, !, ?) с пробелом или переводом строки
+    sentence_endings = ['. ', '! ', '? ', '.\n', '!\n', '?\n']
+    best_pos = -1
+    best_sep = ''
+    for sep in sentence_endings:
         pos = text.rfind(sep, 0, max_len)
-        if pos != -1:
-            end = pos + (len(sep) if sep != ' ' else 0)
-            return text[:end].strip() + '…'
-    return text[:max_len].rsplit(' ', 1)[0].strip() + '…'
+        if pos > best_pos:
+            best_pos = pos
+            best_sep = sep
+
+    if best_pos != -1:
+        # Обрезаем после разделителя, точку оставляем, "…" не добавляем
+        return text[:best_pos + len(best_sep)].strip()
+
+    # 2. Если нет конца предложения, ищем перевод строки (абзац)
+    line_breaks = ['\n\n', '\n']
+    best_pos = -1
+    best_sep = ''
+    for sep in line_breaks:
+        pos = text.rfind(sep, 0, max_len)
+        if pos > best_pos:
+            best_pos = pos
+            best_sep = sep
+
+    if best_pos != -1:
+        # Обрезаем до перевода строки (без "…", это граница абзаца)
+        return text[:best_pos + len(best_sep)].strip()
+
+    # 3. Ищем последний пробел – обрезаем и добавляем "…"
+    pos = text.rfind(' ', 0, max_len)
+    if pos != -1:
+        return text[:pos] + '…'
+
+    # 4. Крайний случай – нет пробелов, обрезаем жёстко
+    return text[:max_len] + '…'
 
 def remove_block_labels(text: str) -> str:
     lines = text.split('\n')
@@ -620,7 +652,7 @@ async def fetch_full_article(url: str, session: aiohttp.ClientSession) -> str:
     except:
         return ""
 
-# ============ ГЕНЕРАЦИЯ ПОСТА (с исправленной обрезкой и ссылкой) ============
+# ============ ГЕНЕРАЦИЯ ПОСТА (исправленная) ============
 async def generate_post(item, session: aiohttp.ClientSession) -> Optional[str]:
     full_text = item.text
     if len(item.text) < 500:
@@ -695,7 +727,8 @@ TASK: Write a detailed post in RUSSIAN. Target length: 2500–3800 characters (T
 
 Пиши на русском:"""
 
-    max_tokens = 3200
+    # ИСПРАВЛЕНИЕ: уменьшили max_tokens с 3200 до 2000
+    max_tokens = 2000
     text, _ = await call_openai_with_retry(prompt, max_tokens, retries=2)
     
     if not text:
@@ -735,13 +768,24 @@ TASK: Write a detailed post in RUSSIAN. Target length: 2500–3800 characters (T
     source_suffix = f"\n\n🔗 <a href='{item.link}'>Источник</a>"
     max_len = 4096 - len(source_suffix) - 5  # запас 5 символов
     
+    # ============ ИСПРАВЛЕННАЯ ОБРЕЗКА ============
     if len(text) > max_len:
         text = smart_trim(text, max_len)
-        logger.info(f"✂️ Trimmed to {len(text)} chars")
-        # Если всё ещё длиннее, обрезаем жёстко
+        # Если всё ещё длиннее – применяем повторно с той же логикой, но без добавления "…" для завершённости
         if len(text) > max_len:
-            text = text[:max_len].rsplit(' ', 1)[0] + '…'
-            logger.info(f"✂️ Hard trimmed to {len(text)} chars")
+            # Ищем последний разделитель предложения в пределах max_len
+            for sep in ['. ', '! ', '? ', '.\n', '!\n', '?\n']:
+                pos = text.rfind(sep, 0, max_len)
+                if pos != -1:
+                    text = text[:pos + len(sep)].strip()
+                    break
+            else:
+                # Если нет – по пробелу (это крайний случай)
+                pos = text.rfind(' ', 0, max_len)
+                if pos != -1:
+                    text = text[:pos] + '…'
+                else:
+                    text = text[:max_len] + '…'
     
     return text + source_suffix
 
