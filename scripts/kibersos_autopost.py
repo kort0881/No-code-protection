@@ -23,7 +23,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from openai import AsyncOpenAI
+from groq import Groq   # <--- заменили на оригинальный Groq
 
 # ============ ЛОГИРОВАНИЕ ============
 logging.basicConfig(
@@ -69,7 +69,7 @@ class ModelConfig:
 
 MODELS = {
     "main": ModelConfig(
-        name="openai/gpt-oss-120b",
+        name="openai/gpt-oss-120b",   # доступна через Groq API
         rpm=30,
         tpm=20000,
         daily_tokens=500000,
@@ -149,11 +149,8 @@ class GroqBudget:
 
 budget = GroqBudget()
 
-# ============ СОЗДАЁМ КЛИЕНТ ============
-openai_client = AsyncOpenAI(
-    api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1"
-)
+# ============ СОЗДАЁМ КЛИЕНТ GROQ ============
+groq_client = Groq(api_key=GROQ_API_KEY)   # синхронный
 
 # ============ ОСТАЛЬНЫЕ ФИЛЬТРЫ (без изменений) ============
 BANNED_PHRASES = [
@@ -601,8 +598,8 @@ class State:
 
 state = State()
 
-# ============ ВЫЗОВ OPENAI ============
-async def call_openai(prompt: str, max_tokens: int = 1500) -> tuple[str, int]:
+# ============ ВЫЗОВ GROQ ============
+async def call_groq(prompt: str, max_tokens: int = 1500) -> tuple[str, int]:
     model_key = "main"
     if not budget.can_use_model(model_key):
         logger.warning("⚠️ Budget exhausted")
@@ -610,11 +607,13 @@ async def call_openai(prompt: str, max_tokens: int = 1500) -> tuple[str, int]:
     cfg = MODELS[model_key]
     try:
         await budget.wait_for_rate_limit(model_key)
-        response = await openai_client.chat.completions.create(
-            model=cfg.name,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-            temperature=0.7
+        response = await asyncio.to_thread(
+            lambda: groq_client.chat.completions.create(
+                model=cfg.name,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=0.7
+            )
         )
         res = response.choices[0].message.content.strip()
         tokens = response.usage.total_tokens if response.usage else 0
@@ -622,12 +621,12 @@ async def call_openai(prompt: str, max_tokens: int = 1500) -> tuple[str, int]:
         logger.info(f"✅ Model: {model_key} ({tokens} tok)")
         return res, tokens
     except Exception as e:
-        logger.warning(f"⚠️ OpenAI error: {e}")
+        logger.warning(f"⚠️ Groq error: {e}")
         return "", 0
 
-async def call_openai_with_retry(prompt: str, max_tokens: int, retries: int = 2) -> tuple[str, int]:
+async def call_groq_with_retry(prompt: str, max_tokens: int, retries: int = 2) -> tuple[str, int]:
     for attempt in range(retries):
-        res, tokens = await call_openai(prompt, max_tokens)
+        res, tokens = await call_groq(prompt, max_tokens)
         if res:
             return res, tokens
         wait = 2 ** attempt * 5
@@ -727,9 +726,8 @@ TASK: Write a detailed post in RUSSIAN. Target length: 2500–3800 characters (T
 
 Пиши на русском:"""
 
-    # ИСПРАВЛЕНИЕ: уменьшили max_tokens с 3200 до 2000
     max_tokens = 2000
-    text, _ = await call_openai_with_retry(prompt, max_tokens, retries=2)
+    text, _ = await call_groq_with_retry(prompt, max_tokens, retries=2)
     
     if not text:
         return None
@@ -768,19 +766,16 @@ TASK: Write a detailed post in RUSSIAN. Target length: 2500–3800 characters (T
     source_suffix = f"\n\n🔗 <a href='{item.link}'>Источник</a>"
     max_len = 4096 - len(source_suffix) - 5  # запас 5 символов
     
-    # ============ ИСПРАВЛЕННАЯ ОБРЕЗКА ============
     if len(text) > max_len:
         text = smart_trim(text, max_len)
-        # Если всё ещё длиннее – применяем повторно с той же логикой, но без добавления "…" для завершённости
         if len(text) > max_len:
-            # Ищем последний разделитель предложения в пределах max_len
+            # повторно, но без добавления "…" для завершённости
             for sep in ['. ', '! ', '? ', '.\n', '!\n', '?\n']:
                 pos = text.rfind(sep, 0, max_len)
                 if pos != -1:
                     text = text[:pos + len(sep)].strip()
                     break
             else:
-                # Если нет – по пробелу (это крайний случай)
                 pos = text.rfind(' ', 0, max_len)
                 if pos != -1:
                     text = text[:pos] + '…'
@@ -871,9 +866,9 @@ def clean_text(text: str) -> str:
     text = html.unescape(text)
     return re.sub(r'\s+', ' ', text).strip()
 
-# ============ ОСНОВНОЙ ЦИКЛ (БЕЗ КАРТИНОК) ============
+# ============ ОСНОВНОЙ ЦИКЛ ============
 async def main():
-    logger.info("🚀 Starting KiberSOS v3.0 (Enhanced, long posts, no generic advice, NO IMAGES) – with openai/gpt-oss-120b")
+    logger.info("🚀 Starting KiberSOS v3.0 (Groq SDK) – с улучшенной обрезкой и ссылкой в конце")
     
     async with aiohttp.ClientSession() as session:
         logger.info("📡 Fetching sources...")
@@ -922,7 +917,6 @@ async def main():
                 state.mark_posted(item.uid, item.title, item.text, detect_topic(item.title, item.text))
                 continue
             
-            # ====== ОТПРАВЛЯЕМ ТОЛЬКО ТЕКСТ, БЕЗ КАРТИНОК ======
             try:
                 await bot.send_message(CHANNEL_ID, text=post_text)
                 logger.info("✅ Posted!")
