@@ -23,7 +23,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from groq import Groq   # <--- заменили на оригинальный Groq
+from groq import Groq
 
 # ============ ЛОГИРОВАНИЕ ============
 logging.basicConfig(
@@ -69,7 +69,7 @@ class ModelConfig:
 
 MODELS = {
     "main": ModelConfig(
-        name="openai/gpt-oss-120b",   # доступна через Groq API
+        name="openai/gpt-oss-120b",
         rpm=30,
         tpm=20000,
         daily_tokens=500000,
@@ -150,7 +150,61 @@ class GroqBudget:
 budget = GroqBudget()
 
 # ============ СОЗДАЁМ КЛИЕНТ GROQ ============
-groq_client = Groq(api_key=GROQ_API_KEY)   # синхронный
+groq_client = Groq(api_key=GROQ_API_KEY)
+
+# ============ КОНФИГ (изменён min_post_length) ============
+class Config:
+    def __init__(self):
+        self.groq_api_key = os.getenv("GROQ_API_KEY")
+        self.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.channel_id = os.getenv("CHANNEL_ID")
+        self.retention_days = 90
+        self.db_file = "posted_articles.db"
+
+        self.title_similarity_threshold = 0.60
+        self.ngram_similarity_threshold = 0.55
+        self.jaccard_threshold = 0.55
+        self.same_domain_similarity = 0.65
+
+        self.subject_window_hours = 48
+        self.max_posts_per_subject = 10
+        self.subject_min_interval_hours = 1
+        self.same_subject_similarity_threshold = 0.70
+
+        self.alternation_enabled = True
+
+        self.min_post_length = 200   # <-- уменьшено для коротких анонсов
+        self.max_article_age_hours = 720
+        self.min_ai_score = 1
+        self.max_repeat_sentences = 2
+
+        self.diversity_window = 8
+        self.same_topic_limit = 4
+
+        self.rotation_history_size = 10
+        self.rotation_max_per_source = 6
+
+        self.source_min_posts_between = 1
+        self.source_max_in_window = 6
+
+        self.batch_subject_limit = 10
+
+        self.groq_retries_per_model = 2
+        self.groq_base_delay = 2.0
+        self.telegram_timeout = 30
+        self.http_timeout = 60
+
+        missing = []
+        for var, name in [(self.groq_api_key, "GROQ_API_KEY"),
+                          (self.telegram_token, "TELEGRAM_BOT_TOKEN"),
+                          (self.channel_id, "CHANNEL_ID")]:
+            if not var:
+                missing.append(name)
+        if missing:
+            raise SystemExit(f"❌ Отсутствуют: {', '.join(missing)}")
+
+config = Config()
+bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 # ============ ОСТАЛЬНЫЕ ФИЛЬТРЫ (без изменений) ============
 BANNED_PHRASES = [
@@ -373,13 +427,9 @@ def post_quality_score(text: str) -> float:
         score += 0.1
     return min(score, 1.0)
 
-# ============ ИСПРАВЛЕННАЯ ФУНКЦИЯ SMART_TRIM ============
 def smart_trim(text: str, max_len: int) -> str:
-    """Обрезает текст до max_len, стараясь завершить на границе предложения или абзаца."""
     if len(text) <= max_len:
         return text
-
-    # 1. Ищем конец предложения (точка, !, ?) с пробелом или переводом строки
     sentence_endings = ['. ', '! ', '? ', '.\n', '!\n', '?\n']
     best_pos = -1
     best_sep = ''
@@ -388,12 +438,8 @@ def smart_trim(text: str, max_len: int) -> str:
         if pos > best_pos:
             best_pos = pos
             best_sep = sep
-
     if best_pos != -1:
-        # Обрезаем после разделителя, точку оставляем, "…" не добавляем
         return text[:best_pos + len(best_sep)].strip()
-
-    # 2. Если нет конца предложения, ищем перевод строки (абзац)
     line_breaks = ['\n\n', '\n']
     best_pos = -1
     best_sep = ''
@@ -402,17 +448,11 @@ def smart_trim(text: str, max_len: int) -> str:
         if pos > best_pos:
             best_pos = pos
             best_sep = sep
-
     if best_pos != -1:
-        # Обрезаем до перевода строки (без "…", это граница абзаца)
         return text[:best_pos + len(best_sep)].strip()
-
-    # 3. Ищем последний пробел – обрезаем и добавляем "…"
     pos = text.rfind(' ', 0, max_len)
     if pos != -1:
         return text[:pos] + '…'
-
-    # 4. Крайний случай – нет пробелов, обрезаем жёстко
     return text[:max_len] + '…'
 
 def remove_block_labels(text: str) -> str:
@@ -598,8 +638,8 @@ class State:
 
 state = State()
 
-# ============ ВЫЗОВ GROQ ============
-async def call_groq(prompt: str, max_tokens: int = 1500) -> tuple[str, int]:
+# ============ ВЫЗОВ GROQ (короткий формат) ============
+async def call_groq(prompt: str, max_tokens: int = 700) -> tuple[str, int]:
     model_key = "main"
     if not budget.can_use_model(model_key):
         logger.warning("⚠️ Budget exhausted")
@@ -651,7 +691,7 @@ async def fetch_full_article(url: str, session: aiohttp.ClientSession) -> str:
     except:
         return ""
 
-# ============ ГЕНЕРАЦИЯ ПОСТА (исправленная) ============
+# ============ ГЕНЕРАЦИЯ ПОСТА (короткий анонс) ============
 async def generate_post(item, session: aiohttp.ClientSession) -> Optional[str]:
     full_text = item.text
     if len(item.text) < 500:
@@ -660,116 +700,60 @@ async def generate_post(item, session: aiohttp.ClientSession) -> Optional[str]:
             full_text = item.text + " " + extra
             logger.info(f"   📄 +{len(extra)} chars")
 
-    prompt = f"""You are a senior editor for a Russian-language Telegram cybersecurity channel (30k+ subscribers).
-Your readers are SOC analysts, pentesters, sysadmins, DevSecOps engineers. They demand DEPTH, not platitudes.
+    prompt = f"""Ты — редактор Telegram-канала о кибербезопасности.
+Сделай краткий анонс (250–500 символов) на русском по новости: суть события, 1–2 ключевых факта, практический вывод.
+Без воды, без рекламы, без призывов подписываться. Ссылку добавлять не нужно — она будет в конце.
+Если новость не про безопасность (уязвимости, атаки, защита, обход блокировок, VPN, DPI, CVE и т.п.) — ответь только словом SKIP.
 
-SOURCE (English):
-Title: {item.title}
-Text: {full_text[:3500]}
+НОВОСТЬ:
+Заголовок: {item.title}
+Содержание: {full_text[:2000]}
+Источник: {item.source}
 
-TASK: Write a detailed post in RUSSIAN. Target length: 2500–3800 characters (Telegram limit is ~4096).
-
-════════════════════════════════════
-❌ INSTANTLY REJECTED — do not write:
-════════════════════════════════════
-• «Обновите антивирус» / «Используйте антивирус» — бесполезно
-• «Установите последнее обновление» — без версии и CVE это мусор
-• «Будьте бдительны» / «Проявляйте осторожность» — пустышка
-• «Включите 2FA» / «Используйте VPN» / «Делайте бэкапы» — банально
-• «Повышайте осведомлённость сотрудников» — вы не корпоративный тренинг
-• Любой совет без конкретного инструмента, команды, пути, порта или хэша
-
-════════════════════════════════════
-✅ ФОРМАТ ПОСТА (строго соблюдать, НЕ ПИСАТЬ слова "БЛОК 1:", "БЛОК 2:" и т.п.):
-════════════════════════════════════
-
-🔥 [Заголовок: название CVE или малвари + суть угрозы, макс. 80 символов]
-
-[Опишите ЧТО ПРОИЗОШЛО: 3–5 предложений]
-Конкретика: кто атакует, какой вектор, какие системы затронуты, масштаб.
-Примеры хорошего стиля:
-  «Группа Lazarus эксплуатирует CVE-2024-21338 (CVSS 8.8) в драйвере appid.sys Windows — позволяет повысить привилегии до SYSTEM через гонку условий в функции NtQuerySystemInformation.»
-  «LockBit 3.0 распространяется через брутфорс RDP (порт 3389) и фишинговые .lnk-файлы, маскированные под PDF. После закрепления — выгружает EDR через Process Hollowing в explorer.exe.»
-
-[Опишите КАК РАБОТАЕТ АТАКА: 3–5 предложений]
-Технический разбор механизма. Цепочка: начальный вектор → закрепление → действия.
-Упоминайте: конкретные техники (MITRE ATT&CK если уместно), инструменты (Cobalt Strike, Mimikatz и т.д.), порты, пути реестра, процессы, Event ID.
-
-[IOC / ТЕХНИЧЕСКИЕ ДЕТАЛИ: список, если есть]
-  • Хэши файлов (MD5/SHA256)
-  • IP/домены C2
-  • Пути файлов или ключи реестра
-  • User-Agent или сетевые сигнатуры
-
-[ЧТО ДЕЛАТЬ: минимум 4 пункта с техническими деталями]
-Каждый пункт — конкретное действие с инструментом/командой/путём.
-НЕ «обновите», а КАК обновить и ЧТО именно.
-НЕ «проверьте логи», а какой Event ID, в каком журнале, какой фильтр.
-
-Примеры ХОРОШИХ пунктов:
-  • Заблокируйте исходящие соединения с рабочих станций на порт 8443/TCP через GPO → Computer Configuration → Windows Settings → Security Settings → Windows Firewall → Outbound Rules → New Rule → Port → 8443
-  • Проверьте Event ID 4688 (создание процесса) в Security.evtx на наличие цепочки: wscript.exe → powershell.exe с параметром -enc или -nop — признак загрузчика
-  • Добавьте в SIEM/EDR правило: процесс с именем svchost32.exe (обратите внимание — не svchost.exe) = немедленный алерт
-  • Если используете Microsoft Defender: Get-MpThreat | Where-Object {{$_.ThreatName -like '*Lazarus*'}} — проверка активных детектов
-
-════════════════════════════════════
-ДОПОЛНИТЕЛЬНЫЕ ПРАВИЛА:
-════════════════════════════════════
-• НИКОГДА не пишите слова "БЛОК 1:", "БЛОК 2:", "БЛОК 3:", "БЛОК 4:" и т.п. — они не нужны.
-• Если есть CVE — всегда указывай CVSS score и affected versions
-• Если нет IOC — пиши «IOC на момент публикации не раскрыты, следим за обновлениями»
-• Пиши уверенно, без воды. Каждое предложение несёт ценность.
-• Не пиши «важно», «следует отметить», «стоит обратить внимание» — это вода
-• Telegram не поддерживает Markdown-таблицы — используй только текст и символы
-
-Если источника недостаточно для технического поста — ответь только словом SKIP.
-
-Пиши на русском:"""
-
-    max_tokens = 2000
+Ответ строго в формате JSON: {{"reject": bool, "post_text": string}}.
+Пиши на русском."""
+    
+    max_tokens = 700
     text, _ = await call_groq_with_retry(prompt, max_tokens, retries=2)
     
     if not text:
         return None
     
-    text = remove_block_labels(text)
-    
-    text_clean = text.strip()
-    if text_clean.upper() == "SKIP" or text_clean.upper().startswith("SKIP"):
-        logger.info("⏩ AI: SKIP")
-        return None
-    
-    if len(text) < 150:
-        logger.info(f"⏩ Too short: {len(text)}")
-        return None
-    
-    if is_too_generic(text):
-        cleaned = clean_banal_advice(text)
-        if len(cleaned) < len(text) * 0.7 or is_too_generic(cleaned):
-            logger.info("⏩ Rejected: generic")
+    # Пробуем распарсить JSON
+    try:
+        data = json.loads(text)
+        if data.get("reject", False):
+            logger.info("⏩ AI: SKIP")
             return None
-        text = cleaned
-        logger.info("🧹 Cleaned from banalities")
+        text = data.get("post_text", "")
+        if not text:
+            return None
+    except json.JSONDecodeError:
+        # Если не JSON, используем как есть
+        text_clean = text.strip()
+        if text_clean.upper() == "SKIP" or text_clean.upper().startswith("SKIP"):
+            logger.info("⏩ AI: SKIP")
+            return None
+        # если слишком коротко – отклоняем
+        if len(text) < 50:
+            logger.info(f"⏩ Too short: {len(text)}")
+            return None
+        text = text_clean
     
-    quality = post_quality_score(text)
-    if quality < 0.4:
-        logger.info(f"⏩ Low quality score: {quality:.2f}")
-        return None
-    logger.info(f"📊 Quality score: {quality:.2f}")
-
-    # ============ УДАЛЯЕМ ССЫЛКИ ИЗ ТЕКСТА, ЧТОБЫ НЕ МЕШАЛИ ============
+    # Удаляем ссылки из текста (чтобы не дублировать)
     text = re.sub(r'https?://\S+', '', text)
     text = re.sub(r'<a\s+[^>]*>.*?</a>', '', text, flags=re.DOTALL)
     text = re.sub(r'<a\s+[^>]*>', '', text, flags=re.IGNORECASE)
     text = re.sub(r'</a>', '', text, flags=re.IGNORECASE)
     
+    # Добавляем ссылку на источник
     source_suffix = f"\n\n🔗 <a href='{item.link}'>Источник</a>"
-    max_len = 4096 - len(source_suffix) - 5  # запас 5 символов
     
+    # Оставляем запас для обрезки
+    max_len = 4096 - len(source_suffix) - 5
     if len(text) > max_len:
         text = smart_trim(text, max_len)
         if len(text) > max_len:
-            # повторно, но без добавления "…" для завершённости
             for sep in ['. ', '! ', '? ', '.\n', '!\n', '?\n']:
                 pos = text.rfind(sep, 0, max_len)
                 if pos != -1:
@@ -793,8 +777,6 @@ class NewsItem:
     link: str
     source: str
     uid: str
-
-bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 # ============ СБОР RSS И YOUTUBE ============
 async def fetch_rss(source: dict, session: aiohttp.ClientSession) -> list:
@@ -868,7 +850,7 @@ def clean_text(text: str) -> str:
 
 # ============ ОСНОВНОЙ ЦИКЛ ============
 async def main():
-    logger.info("🚀 Starting KiberSOS v3.0 (Groq SDK) – с улучшенной обрезкой и ссылкой в конце")
+    logger.info("🚀 Starting KiberSOS v3.0 (Groq SDK) – короткие анонсы, как FREE CODING")
     
     async with aiohttp.ClientSession() as session:
         logger.info("📡 Fetching sources...")
