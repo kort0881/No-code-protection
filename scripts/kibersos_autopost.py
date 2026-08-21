@@ -691,7 +691,7 @@ async def fetch_full_article(url: str, session: aiohttp.ClientSession) -> str:
     except:
         return ""
 
-# ============ ГЕНЕРАЦИЯ ПОСТА (короткий анонс) ============
+# ============ ГЕНЕРАЦИЯ ПОСТА (исправлена: отбрасываем "SKIP") ============
 async def generate_post(item, session: aiohttp.ClientSession) -> Optional[str]:
     full_text = item.text
     if len(item.text) < 500:
@@ -723,18 +723,22 @@ async def generate_post(item, session: aiohttp.ClientSession) -> Optional[str]:
     try:
         data = json.loads(text)
         if data.get("reject", False):
-            logger.info("⏩ AI: SKIP")
+            logger.info("⏩ AI: SKIP (reject=true)")
             return None
         text = data.get("post_text", "")
         if not text:
+            logger.info("⏩ AI: empty post_text")
+            return None
+        # ============ НОВАЯ ПРОВЕРКА ============
+        if text.strip().upper() == "SKIP" or text.strip().upper().startswith("SKIP"):
+            logger.info("⏩ AI: post_text is SKIP, rejecting")
             return None
     except json.JSONDecodeError:
         # Если не JSON, используем как есть
         text_clean = text.strip()
         if text_clean.upper() == "SKIP" or text_clean.upper().startswith("SKIP"):
-            logger.info("⏩ AI: SKIP")
+            logger.info("⏩ AI: SKIP (plain text)")
             return None
-        # если слишком коротко – отклоняем
         if len(text) < 50:
             logger.info(f"⏩ Too short: {len(text)}")
             return None
