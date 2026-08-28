@@ -2,11 +2,11 @@ name: KIBER SOS Autopost
 
 on:
   schedule:
-    # 06:00 UTC = 09:00 МСК
-    # 12:00 UTC = 15:00 МСК
-    # 15:00 UTC = 18:00 МСК
-    # 18:00 UTC = 21:00 МСК
-    - cron: '0 6,12,15,18 * * *'
+    # 06:23 UTC = 09:23 МСК
+    # 12:23 UTC = 15:23 МСК
+    # 15:23 UTC = 18:23 МСК
+    # 18:23 UTC = 21:23 МСК
+    - cron: '23 6,12,15,18 * * *'
   workflow_dispatch:
 
 permissions:
@@ -45,5 +45,3 @@ jobs:
           git config --local user.name "KiberSOS Bot"
           git add cache_sec/
           git diff --quiet && git diff --staged --quiet || (git commit -m "Update history [skip ci]" && git push)
-
-
