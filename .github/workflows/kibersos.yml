@@ -2,10 +2,8 @@ name: KIBER SOS Autopost
 
 on:
   schedule:
-    # 06:23 UTC = 09:23 МСК
-    # 12:23 UTC = 15:23 МСК
-    # 15:23 UTC = 18:23 МСК
-    # 18:23 UTC = 21:23 МСК
+    # Московское время: 09:23, 15:23, 18:23, 21:23
+    # UTC: 6:23, 12:23, 15:23, 18:23
     - cron: '23 6,12,15,18 * * *'
   workflow_dispatch:
 
@@ -38,7 +36,6 @@ jobs:
           CACHE_DIR: cache_sec
         run: python scripts/kibersos_autopost.py
       
-      # СОХРАНЕНИЕ КЭША — ВАЖНО!
       - name: Commit state
         run: |
           git config --local user.email "action@github.com"
