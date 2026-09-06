@@ -9,7 +9,6 @@ import re
 import time
 import hashlib
 import html
-import urllib.parse
 import tempfile
 import shutil
 import logging
@@ -25,927 +24,694 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from groq import Groq
 
-# ============ ЛОГИРОВАНИЕ ============
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%H:%M:%S'
 )
-logger = logging.getLogger("KiberSOS")
-logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger('KiberSOS')
+logging.getLogger('httpx').setLevel(logging.WARNING)
 
-# ============ КОНФИГУРАЦИЯ ============
+
 def get_env(name: str) -> str:
-    val = os.getenv(name)
-    if not val:
-        logger.error(f"Missing: {name}")
-        exit(1)
-    return val
+    value = os.getenv(name)
+    if not value:
+        raise SystemExit(f'❌ Missing environment variable: {name}')
+    return value
 
-GROQ_API_KEY = get_env("GROQ_API_KEY")
-TELEGRAM_BOT_TOKEN = get_env("TELEGRAM_BOT_TOKEN")
-CHANNEL_ID = get_env("CHANNEL_ID")
 
-CACHE_DIR = os.getenv("CACHE_DIR", "cache_sec")
+GROQ_API_KEY = get_env('GROQ_API_KEY')
+TELEGRAM_BOT_TOKEN = get_env('TELEGRAM_BOT_TOKEN')
+CHANNEL_ID = get_env('CHANNEL_ID')
+
+CACHE_DIR = os.getenv('CACHE_DIR', 'cache_sec')
 os.makedirs(CACHE_DIR, exist_ok=True)
-STATE_FILE = os.path.join(CACHE_DIR, "state_groq_v2.json")
-
-TEXT_ONLY_THRESHOLD = 1000000
+STATE_FILE = os.path.join(CACHE_DIR, 'state_groq_v3.json')
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=35)
 MAX_POSTED_IDS = 500
-HTTP_TIMEOUT = aiohttp.ClientTimeout(total=25)
-
 RECENT_POSTS_CHECK = 10
-RECENT_SIMILARITY_THRESHOLD = 0.40
-MIN_TOPIC_DIVERSITY = 3
+RECENT_SIMILARITY_THRESHOLD = 0.50
 
-# ============ МОДЕЛЬ (одна, новая) ============
+
 @dataclass
 class ModelConfig:
     name: str
     rpm: int
-    tpm: int
     daily_tokens: int
-    priority: int
+
 
 MODELS = {
-    "main": ModelConfig(
-        name="openai/gpt-oss-120b",
+    'main': ModelConfig(
+        name='openai/gpt-oss-120b',
         rpm=30,
-        tpm=20000,
         daily_tokens=500000,
-        priority=1
-    ),
+    )
 }
+
 
 class GroqBudget:
     def __init__(self):
-        self.state_file = os.path.join(CACHE_DIR, "groq_budget.json")
+        self.state_file = os.path.join(CACHE_DIR, 'groq_budget.json')
         self.data = self._load()
-    
+
     def _load(self) -> dict:
+        today = time.strftime('%Y-%m-%d')
         default = {
-            "daily_tokens": {},
-            "last_reset": time.strftime("%Y-%m-%d"),
-            "last_request_time": {},
-            "request_count": {},
-            "minute_start": {},
+            'daily_tokens': {},
+            'last_reset': today,
+            'last_request_time': {},
+            'request_count': {},
+            'minute_start': {},
         }
-        if os.path.exists(self.state_file):
-            try:
-                with open(self.state_file, "r") as f:
-                    saved = json.load(f)
-                    if saved.get("last_reset") != time.strftime("%Y-%m-%d"):
-                        logger.info("🔄 New day — reset limits")
-                        saved["daily_tokens"] = {}
-                        saved["last_reset"] = time.strftime("%Y-%m-%d")
-                    default.update(saved)
-            except:
-                pass
-        return default
-    
-    def save(self):
         try:
-            with open(self.state_file, "w") as f:
-                json.dump(self.data, f)
-        except:
-            pass
-    
-    def add_tokens(self, model: str, tokens: int):
-        self.data["daily_tokens"][model] = self.data["daily_tokens"].get(model, 0) + tokens
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r', encoding='utf-8') as f:
+                    saved = json.load(f)
+                if saved.get('last_reset') != today:
+                    saved['daily_tokens'] = {}
+                    saved['last_reset'] = today
+                    logger.info('🔄 New day: Groq token budget reset')
+                default.update(saved)
+        except Exception as exc:
+            logger.warning(f'Budget state load error: {exc}')
+        return default
+
+    def save(self) -> None:
+        try:
+            with open(self.state_file, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning(f'Budget state save error: {exc}')
+
+    def add_tokens(self, model_name: str, tokens: int) -> None:
+        self.data['daily_tokens'][model_name] = self.data['daily_tokens'].get(model_name, 0) + tokens
         self.save()
-    
+
     def can_use_model(self, model_key: str) -> bool:
-        if model_key not in MODELS:
-            return False
         cfg = MODELS[model_key]
-        used = self.data["daily_tokens"].get(cfg.name, 0)
+        used = self.data['daily_tokens'].get(cfg.name, 0)
         remaining = cfg.daily_tokens - used
-        if remaining < cfg.daily_tokens * 0.1:
-            logger.warning(f"⚠️ Low daily tokens for {model_key}: {remaining} left")
-        return remaining > (cfg.daily_tokens * 0.05)
-    
-    async def wait_for_rate_limit(self, model_key: str):
+        if remaining <= cfg.daily_tokens * 0.10:
+            logger.warning(f'⚠️ Groq daily token budget low: {remaining} tokens left')
+        return remaining > cfg.daily_tokens * 0.05
+
+    async def wait_for_rate_limit(self, model_key: str) -> None:
         cfg = MODELS[model_key]
         model = cfg.name
         now = time.time()
-        
-        if now - self.data["minute_start"].get(model, 0) > 60:
-            self.data["minute_start"][model] = now
-            self.data["request_count"][model] = 0
-        
-        if self.data["request_count"].get(model, 0) >= cfg.rpm - 2:
-            wait = 60 - (now - self.data["minute_start"][model]) + 1
-            logger.info(f"⏳ RPM limit ({model_key}). Waiting {wait:.1f}s")
+        minute_start = self.data['minute_start'].get(model, 0)
+
+        if now - minute_start >= 60:
+            self.data['minute_start'][model] = now
+            self.data['request_count'][model] = 0
+
+        request_count = self.data['request_count'].get(model, 0)
+        if request_count >= cfg.rpm - 2:
+            wait = max(1, 61 - (now - self.data['minute_start'][model]))
+            logger.info(f'⏳ Groq RPM limit. Waiting {wait:.1f}s')
             await asyncio.sleep(wait)
-            self.data["minute_start"][model] = time.time()
-            self.data["request_count"][model] = 0
-        
-        last = self.data["last_request_time"].get(model, 0)
-        if now - last < 2:
-            await asyncio.sleep(2)
-        
-        self.data["request_count"][model] = self.data["request_count"].get(model, 0) + 1
-        self.data["last_request_time"][model] = time.time()
+            self.data['minute_start'][model] = time.time()
+            self.data['request_count'][model] = 0
+
+        last_request = self.data['last_request_time'].get(model, 0)
+        delay = 2 - (time.time() - last_request)
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        self.data['request_count'][model] = self.data['request_count'].get(model, 0) + 1
+        self.data['last_request_time'][model] = time.time()
+        self.save()
+
 
 budget = GroqBudget()
-
-# ============ СОЗДАЁМ КЛИЕНТ GROQ ============
 groq_client = Groq(api_key=GROQ_API_KEY)
+bot = Bot(
+    token=TELEGRAM_BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 
-# ============ КОНФИГ (изменён min_post_length) ============
+
 class Config:
-    def __init__(self):
-        self.groq_api_key = os.getenv("GROQ_API_KEY")
-        self.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
-        self.channel_id = os.getenv("CHANNEL_ID")
-        self.retention_days = 90
-        self.db_file = "posted_articles.db"
+    min_post_length = 700
+    max_post_length = 1900
+    max_article_age_hours = 720
+    max_posts_per_run = 1
+    max_attempts = 15
 
-        self.title_similarity_threshold = 0.60
-        self.ngram_similarity_threshold = 0.55
-        self.jaccard_threshold = 0.55
-        self.same_domain_similarity = 0.65
-
-        self.subject_window_hours = 48
-        self.max_posts_per_subject = 10
-        self.subject_min_interval_hours = 1
-        self.same_subject_similarity_threshold = 0.70
-
-        self.alternation_enabled = True
-
-        self.min_post_length = 200   # <-- уменьшено для коротких анонсов
-        self.max_article_age_hours = 720
-        self.min_ai_score = 1
-        self.max_repeat_sentences = 2
-
-        self.diversity_window = 8
-        self.same_topic_limit = 4
-
-        self.rotation_history_size = 10
-        self.rotation_max_per_source = 6
-
-        self.source_min_posts_between = 1
-        self.source_max_in_window = 6
-
-        self.batch_subject_limit = 10
-
-        self.groq_retries_per_model = 2
-        self.groq_base_delay = 2.0
-        self.telegram_timeout = 30
-        self.http_timeout = 60
-
-        missing = []
-        for var, name in [(self.groq_api_key, "GROQ_API_KEY"),
-                          (self.telegram_token, "TELEGRAM_BOT_TOKEN"),
-                          (self.channel_id, "CHANNEL_ID")]:
-            if not var:
-                missing.append(name)
-        if missing:
-            raise SystemExit(f"❌ Отсутствуют: {', '.join(missing)}")
 
 config = Config()
-bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-
-# ============ ОСТАЛЬНЫЕ ФИЛЬТРЫ (без изменений) ============
-BANNED_PHRASES = [
-    "из доверенных источников", "регулярно обновляйте", "будьте бдительны",
-    "используйте антивирус", "надёжный пароль", "надежный пароль",
-    "будьте осторожны", "проверяйте ссылки", "сложные пароли",
-    "защитить свои данные", "потенциальных атак", "соблюдайте осторожность",
-    "базовые правила", "кибергигиен", "используйте надежн",
-    "регулярное резервное", "обучение сотрудников", "повышение осведомленности",
-    "комплексный подход", "многоуровневая защита", "своевременно устанавливайте",
-    "будьте внимательны", "не открывайте подозрительные", "проявляйте осторожность",
-    "обновить сигнатуры", "обновите сигнатуры", "обновление сигнатур",
-    "антивирусное ПО", "антивирус", "антивируса", "антивирусные",
-    "включить детекцию", "включите детекцию", "включить обнаружение",
-    "сканировать систему", "провести сканирование", "полное сканирование",
-    "рекомендуется обновить", "следует обновить", "необходимо обновить",
-    "выпустила исправление", "выпустила патч", "выпустила обновление",
-    "установите последнее обновление", "обновитесь до последней версии",
-    "своевременно устанавливайте обновления", "не откладывайте обновления",
-    "принять меры", "предпринять шаги", "обеспечить безопасность",
-    "делайте резервные копии", "создавайте бэкапы", "резервное копирование",
-    "включите двухфакторную аутентификацию", "включите 2fa", "используйте двухфакторную",
-    "используйте vpn", "подключайтесь через vpn", "настройте firewall",
-    "меняйте пароли", "используйте уникальные пароли", "парольный менеджер",
-    "регулярно обновляйте программное обеспечение", "используйте лицензионное ПО",
-    "не скачивайте файлы из непроверенных источников", "проверяйте цифровые подписи",
-    "настройте брандмауэр", "ограничьте права пользователей", "применяйте принцип наименьших привилегий",
-    "сегментируйте сеть", "используйте списки контроля доступа",
-]
-
-BANNED_ADVICE_PATTERNS = [
-    r'обнови(те|ть)?\s+(сигнатуры|антивирус|защитник|базы)',
-    r'включи(те|ть)?\s+(детекцию|обнаружение|защиту|функцию)',
-    r'установи(те|ть)?\s+(последнее|новое|свежее)\s+(обновление|патч|исправление)',
-    r'обнови(те|ться)?\s+до\s+последней\s+версии',
-    r'сканируй(те|ть)?\s+(систему|устройство)',
-    r'проведи(те|ть)?\s+(сканирование|проверку|аудит)',
-    r'используй(те|ть)?\s+(антивирус|защитник|защитное\s+ПО)',
-    r'будь(те)?\s+(осторожны|бдительны|внимательны)',
-    r'проявляй(те)?\s+(осторожность|бдительность)',
-    r'проверяй(те|ть)?\s+(ссылки|вложения|письма)',
-    r'не\s+(открывай(те)?|кликай(те)?)\s+подозрительные',
-    r'создавай(те|ть)?\s+(резервные\s+копии|бэкапы)',
-    r'делай(те)?\s+резервные\s+копии',
-    r'включи(те|ть)?\s+(2fa|mfa|двухфакторную)',
-    r'используй(те|ть)?\s+(vpn|файрвол|межсетевой)',
-    r'регулярно\s+(обновляй(те)?|меняй(те)?|проверяй(те)?)',
-    r'своевременно\s+(устанавливай(те)?|обновляй(те)?)',
-    r'приня(ть|тие)\s+(меры|мер|действия|шаги)',
-    r'обеспеч(ите|ить)\s+безопасность',
-    r'повыс(ите|ить)\s+(уровень\s+)?безопасности',
-    r'усил(ите|ить)\s+(защиту|безопасность)',
-    r'след(ует|ить)\s+(за\s+)?обновлениями',
-    r'монитор(ьте|инг)\s+(трафик|события|логи|активность)',
-    r'обуч(ите|айте)\s+сотрудников',
-    r'повы(сьте|шайте)\s+осведомленность',
-    r'соблюдай(те)?\s+(правила|меры)',
-    r'комплексн(ый|ого|ая)\s+(подход|меры|защита)',
-    r'многоуровнев(ая|ую|ой)\s+защита',
-    r'кибергигиен(а|ы|е|у)',
-]
-
-SPECIFIC_INDICATORS = [
-    r'CVE-\d{4}-\d+',
-    r'\d+\.\d+\.\d+[\.\d+]*',
-    r'порт[ы]?\s*\d+',
-    r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}',
-    r'[a-f0-9]{32,64}',
-    r'0x[a-f0-9]+',
-    r'\b[A-Z]:\\',
-    r'/etc/|/var/|/tmp/|/usr/|/opt/',
-    r'\.[exe|dll|apk|ps1|bat|sh|vbs|msi|doc|docx|pdf|zip|rar]{3,4}\b',
-    r'\b(powershell|cmd|bash|python|curl|wget|netsh|reg\s+add|chmod|chown|sudo|netstat|tasklist|sc\s+query)\b',
-    r'\b(smb|rdp|ssh|ldap|kerberos|http|https|ftp|smtp|dns|vpn|ipsec|ssl|tls)\b',
-    r'\b(sql\s*injection|sqli|xss|csrf|ssrf|rce|lpe|rop|heap\s+spray|uaf|use.after.free)\b',
-    r'\b(mimikatz|cobalt\s*strike|metasploit|burp|nmap|wireshark|volatility|yara|sigma)\b',
-    r'\b(ioc|indicator\s+of\s+compromise|ttp|ttps|mitre\s+att&ck|cvss|epss)\b',
-    r'https?://[^\s]+',
-]
-
-STRONG_TECH_INDICATORS = [
-    "cve-", "0day", "exploit", "payload", "backdoor", "trojan",
-    "ransomware", "apt28", "lazarus", "lockbit", "blackcat",
-    ".exe", ".dll", ".ps1", "powershell", "mimikatz", "cobalt strike",
-    "reverse shell", "sql injection", "sqli", "rce", "lpe",
-    "lateral movement", "persistence", "yara", "sigma rule",
-]
-
-TECH_INDICATORS = [
-    "cve", "vulnerability", "exploit", "malware", "ransomware",
-    "backdoor", "trojan", "botnet", "apt", "zero-day", "patch",
-    "breach", "leak", "hack", "attack", "compromise",
-    "windows", "linux", "android", "microsoft", "google",
-    "уязвимост", "вредонос", "эксплойт", "фишинг", "хакер", "атак",
-]
 
 STOP_WORDS = [
-    "headphone", "earbuds", "airpods", "bluetooth speaker", "jbl",
-    "bose", "sony wh-", "beats", "sennheiser", "noise canceling",
-    "audio quality", "phone review", "camera review", "unboxing",
-    "quarterly earnings", "appointed ceo", "stock price", "bitcoin price",
-    "casino", "gambling", "weight loss", "free iphone", "work from home",
+    'headphone', 'earbuds', 'airpods', 'bluetooth speaker', 'jbl', 'bose',
+    'sony wh-', 'beats', 'sennheiser', 'noise canceling', 'audio quality',
+    'phone review', 'camera review', 'unboxing', 'quarterly earnings',
+    'appointed ceo', 'stock price', 'bitcoin price', 'casino', 'gambling',
+    'weight loss', 'free iphone', 'work from home',
 ]
 
 SECURITY_KEYWORDS = [
-    "vulnerability", "exploit", "malware", "ransomware", "phishing",
-    "breach", "leak", "hack", "attack", "patch", "cve", "0day",
-    "apt", "threat actor", "lockbit", "blackcat", "alert", "ioc",
+    'vulnerability', 'exploit', 'malware', 'ransomware', 'phishing', 'breach',
+    'leak', 'hack', 'attack', 'patch', 'cve', '0day', 'zero-day', 'apt',
+    'threat actor', 'lockbit', 'blackcat', 'alert', 'ioc', 'vpn', 'dpi',
+    'proxy', 'censorship', 'block', 'уязвимост', 'эксплойт', 'вредонос',
+    'вымогател', 'фишинг', 'утечк', 'хакер', 'атак', 'блокировк', 'прокси',
 ]
 
-# ============ ФИЛЬТРЫ (без изменений) ============
+GENERIC_ADVICE_PHRASES = [
+    'будьте бдительны', 'будьте осторожны', 'будьте внимательны',
+    'соблюдайте осторожность', 'регулярно обновляйте',
+    'используйте сложные пароли', 'используйте надежные пароли',
+    'используйте уникальные пароли', 'защитить свои данные',
+    'комплексный подход', 'многоуровневая защита', 'повышение осведомленности',
+    'обучение сотрудников', 'проверяйте ссылки', 'проверяйте вложения',
+    'не открывайте подозрительные', 'делайте резервные копии',
+    'создавайте бэкапы', 'своевременно устанавливайте обновления',
+]
+
+
+def clean_text(text: str) -> str:
+    if not text:
+        return ''
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = html.unescape(text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
 def passes_local_filters(title: str, text: str) -> bool:
-    content = (title + " " + text).lower()
-    title_lower = title.lower()
-    for stop in STOP_WORDS:
-        if stop in content:
-            return False
-    has_security = any(kw in content for kw in SECURITY_KEYWORDS)
-    if not has_security:
+    content = f'{title} {text}'.lower()
+    if any(word in content for word in STOP_WORDS):
         return False
     if len(text) < 50:
         return False
-    return True
+    return any(keyword in content for keyword in SECURITY_KEYWORDS)
 
-def count_specific_indicators(text: str) -> int:
-    count = 0
-    text_lower = text.lower()
-    for pattern in SPECIFIC_INDICATORS:
-        count += len(re.findall(pattern, text_lower, re.IGNORECASE))
-    for ind in STRONG_TECH_INDICATORS:
-        if ind in text_lower:
-            count += 2
-    return count
 
-def has_banned_advice(text: str) -> tuple[bool, list]:
-    text_lower = text.lower()
-    found = []
-    for phrase in BANNED_PHRASES:
-        if phrase in text_lower:
-            found.append(phrase)
-    for pattern in BANNED_ADVICE_PATTERNS:
-        matches = re.findall(pattern, text_lower)
-        found.extend(matches)
-    return len(found) > 0, list(set(found))
-
-def extract_advice_section(text: str) -> str:
-    patterns = [
-        r'👇\s*Что делать[:：]?(.*?)(?:\n\n|$)',
-        r'👇\s*Рекомендации[:：]?(.*?)(?:\n\n|$)',
-        r'🔧\s*Что делать[:：]?(.*?)(?:\n\n|$)',
-        r'✅\s*Рекомендации[:：]?(.*?)(?:\n\n|$)',
-        r'📌\s*Меры[:：]?(.*?)(?:\n\n|$)',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-    lines = text.split('\n')
-    advice = []
-    for line in reversed(lines):
-        if '•' in line or '-' in line or '*' in line:
-            advice.insert(0, line)
-        elif advice:
-            break
-    return '\n'.join(advice)
-
-def is_too_generic(text: str) -> bool:
-    text_lower = text.lower()
-    banned_count = sum(1 for phrase in BANNED_PHRASES if phrase in text_lower)
-    has_banned_patterns, _ = has_banned_advice(text)
-    specific_count = count_specific_indicators(text)
-    strong_tech = sum(1 for t in STRONG_TECH_INDICATORS if t in text_lower)
-    advice = extract_advice_section(text)
-    advice_banal, _ = has_banned_advice(advice) if advice else (False, [])
-    if banned_count >= 2:
-        return True
-    if advice and advice_banal and count_specific_indicators(advice) < 2:
-        return True
-    if specific_count == 0 and strong_tech < 1:
-        return True
-    tech_count = sum(1 for term in TECH_INDICATORS if term in text_lower)
-    if tech_count < 2:
-        return True
-    words = re.sub(r'[^\w\s]', '', text).split()
-    if len(words) < 25:
-        return True
-    if banned_count >= 1 and specific_count < 2 and strong_tech < 2:
-        return True
-    return False
-
-def clean_banal_advice(text: str) -> str:
-    lines = text.split('\n')
-    cleaned = []
-    for line in lines:
-        low = line.lower()
-        if any(phrase in low for phrase in BANNED_PHRASES):
-            continue
-        if any(re.search(p, low) for p in BANNED_ADVICE_PATTERNS):
-            continue
-        cleaned.append(line)
-    return '\n'.join(cleaned)
-
-def post_quality_score(text: str) -> float:
-    score = 0.0
-    cves = re.findall(r'CVE-\d{4}-\d+', text, re.I)
-    score += min(len(cves) * 0.2, 0.6)
-    ips = re.findall(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', text)
-    score += min(len(ips) * 0.15, 0.5)
-    hashes = re.findall(r'[a-fA-F0-9]{32,64}', text)
-    score += min(len(hashes) * 0.2, 0.6)
-    commands = re.findall(r'(?i)(powershell|cmd|reg add|sc config|netsh|wmic|gpupdate)', text)
-    score += min(len(commands) * 0.1, 0.4)
-    paths = re.findall(r'[A-Z]:\\[^\s]+|/etc/[^\s]+|/var/[^\s]+', text)
-    score += min(len(paths) * 0.1, 0.3)
-    ports = re.findall(r'порт[а-я]*\s*\d+', text, re.I)
-    score += min(len(ports) * 0.1, 0.3)
-    if len(text) > 2000:
-        score += 0.2
-    elif len(text) > 1000:
-        score += 0.1
-    return min(score, 1.0)
-
-def smart_trim(text: str, max_len: int) -> str:
-    if len(text) <= max_len:
-        return text
-    sentence_endings = ['. ', '! ', '? ', '.\n', '!\n', '?\n']
-    best_pos = -1
-    best_sep = ''
-    for sep in sentence_endings:
-        pos = text.rfind(sep, 0, max_len)
-        if pos > best_pos:
-            best_pos = pos
-            best_sep = sep
-    if best_pos != -1:
-        return text[:best_pos + len(best_sep)].strip()
-    line_breaks = ['\n\n', '\n']
-    best_pos = -1
-    best_sep = ''
-    for sep in line_breaks:
-        pos = text.rfind(sep, 0, max_len)
-        if pos > best_pos:
-            best_pos = pos
-            best_sep = sep
-    if best_pos != -1:
-        return text[:best_pos + len(best_sep)].strip()
-    pos = text.rfind(' ', 0, max_len)
-    if pos != -1:
-        return text[:pos] + '…'
-    return text[:max_len] + '…'
-
-def remove_block_labels(text: str) -> str:
-    lines = text.split('\n')
-    cleaned = []
-    for line in lines:
-        if re.search(r'^\s*(\*\*)?\s*БЛОК\s+\d+\s*[:—\-]', line, re.IGNORECASE):
-            continue
-        if re.search(r'\[\s*БЛОК\s+\d+\s*[:—\-]', line, re.IGNORECASE):
-            continue
-        cleaned.append(line)
-    cleaned_text = '\n'.join(cleaned)
-    cleaned_text = re.sub(r'\*\*БЛОК\s+\d+\s*[:—\-][^*]*\*\*', '', cleaned_text, flags=re.IGNORECASE)
-    cleaned_text = re.sub(r'БЛОК\s+\d+\s*[:—\-]', '', cleaned_text, flags=re.IGNORECASE)
-    return cleaned_text.strip()
-
-# ============ СОСТОЯНИЕ И ДУБЛИКАТЫ ============
 def normalize_title(title: str) -> str:
-    title = title.lower()
-    title = re.sub(r'[^\w\s]', '', title)
-    stop = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'in', 'on', 'at', 'to', 'for', 'of', 'and', 'or', 'new', 'how'}
-    words = [w for w in title.split() if w not in stop and len(w) > 2]
-    return ' '.join(words)
+    title = re.sub(r'[^\w\s]', ' ', title.lower())
+    stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'in', 'on', 'at', 'to', 'for', 'of', 'and', 'or', 'new', 'how'}
+    return ' '.join(word for word in title.split() if word not in stop_words and len(word) > 2)
 
-def extract_key_entities(text: str) -> set:
-    entities = set()
-    cves = re.findall(r'CVE-\d{4}-\d+', text, re.I)
-    entities.update(cve.upper() for cve in cves)
-    malware = re.findall(r'\b([A-Z][a-z]+(?:Bot|Locker|Ware|Lock|Cat|Bear|Worm)?)\b', text)
-    entities.update(m.lower() for m in malware if len(m) > 3)
-    known = ['lockbit', 'blackcat', 'lazarus', 'apt28', 'sandworm', 'emotet', 'trickbot', 'cobalt strike']
-    text_lower = text.lower()
-    for k in known:
-        if k in text_lower:
-            entities.add(k)
-    companies = ['microsoft', 'google', 'apple', 'cisco', 'fortinet', 'vmware', 'windows', 'linux']
-    for c in companies:
-        if c in text_lower:
-            entities.add(c)
+
+def extract_key_entities(text: str) -> set[str]:
+    entities = {value.upper() for value in re.findall(r'CVE-\d{4}-\d+', text, re.I)}
+    lower = text.lower()
+    for name in [
+        'lockbit', 'blackcat', 'lazarus', 'apt28', 'sandworm', 'emotet',
+        'trickbot', 'cobalt strike', 'microsoft', 'google', 'apple', 'cisco',
+        'fortinet', 'vmware', 'windows', 'linux', 'android', 'telegram',
+    ]:
+        if name in lower:
+            entities.add(name)
     return entities
 
+
 def detect_topic(title: str, text: str) -> str:
-    content = (title + " " + text).lower()
-    if any(x in content for x in ['ransomware', 'lockbit', 'blackcat']):
+    content = f'{title} {text}'.lower()
+    if any(value in content for value in ['ransomware', 'lockbit', 'blackcat', 'вымогател']):
         return 'ransomware'
-    if any(x in content for x in ['apt', 'lazarus', 'apt28', 'sandworm']):
+    if any(value in content for value in ['apt', 'lazarus', 'apt28', 'sandworm']):
         return 'apt'
     if re.search(r'cve-\d{4}-\d+', content):
         return 'vulnerability'
-    if any(x in content for x in ['phishing', 'social engineering']):
+    if any(value in content for value in ['phishing', 'social engineering', 'фишинг']):
         return 'phishing'
-    if any(x in content for x in ['ddos', 'botnet']):
+    if any(value in content for value in ['ddos', 'botnet']):
         return 'ddos'
-    if any(x in content for x in ['breach', 'leak', 'exposed']):
+    if any(value in content for value in ['breach', 'leak', 'exposed', 'утечк']):
         return 'breach'
-    if any(x in content for x in ['patch', 'update']):
+    if any(value in content for value in ['vpn', 'dpi', 'proxy', 'block', 'блокировк', 'прокси']):
+        return 'privacy_network'
+    if any(value in content for value in ['patch', 'update', 'обновлен', 'патч']):
         return 'patch'
     return 'general'
 
-def calculate_similarity(title1, text1, title2, text2) -> float:
-    norm1 = normalize_title(title1)
-    norm2 = normalize_title(title2)
-    title_sim = SequenceMatcher(None, norm1, norm2).ratio()
-    entities1 = extract_key_entities(title1 + " " + text1)
-    entities2 = extract_key_entities(title2 + " " + text2)
-    if entities1 and entities2:
-        inter = len(entities1 & entities2)
-        union = len(entities1 | entities2)
-        entity_sim = inter / union if union else 0
-        cve1 = {e for e in entities1 if e.startswith('CVE-')}
-        cve2 = {e for e in entities2 if e.startswith('CVE-')}
-        if cve1 and cve2 and cve1 & cve2:
-            return 1.0
-    else:
-        entity_sim = 0
-    text_sim = SequenceMatcher(None, text1[:500].lower(), text2[:500].lower()).ratio()
-    return title_sim * 0.5 + entity_sim * 0.35 + text_sim * 0.15
+
+def calculate_similarity(title1: str, text1: str, title2: str, text2: str) -> float:
+    title_similarity = SequenceMatcher(None, normalize_title(title1), normalize_title(title2)).ratio()
+    entities1 = extract_key_entities(f'{title1} {text1}')
+    entities2 = extract_key_entities(f'{title2} {text2}')
+    entity_similarity = len(entities1 & entities2) / len(entities1 | entities2) if entities1 and entities2 else 0.0
+    cve1 = {entity for entity in entities1 if entity.startswith('CVE-')}
+    cve2 = {entity for entity in entities2 if entity.startswith('CVE-')}
+    if cve1 and cve2 and cve1 & cve2:
+        return 1.0
+    text_similarity = SequenceMatcher(None, text1[:700].lower(), text2[:700].lower()).ratio()
+    return title_similarity * 0.50 + entity_similarity * 0.35 + text_similarity * 0.15
+
 
 class State:
     def __init__(self):
         self.data = {
-            "posted_ids": {},
-            "recent_titles": [],
-            "recent_posts": [],
-            "recent_topics": []
+            'posted_ids': {},
+            'recent_titles': [],
+            'recent_posts': [],
+            'recent_topics': [],
         }
         self._load()
-    
-    def _load(self):
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE, "r", encoding="utf-8") as f:
-                    loaded = json.load(f)
-                    self.data.update(loaded)
-                    if "recent_posts" not in self.data:
-                        self.data["recent_posts"] = []
-                    if "recent_topics" not in self.data:
-                        self.data["recent_topics"] = []
-            except:
-                pass
-    
-    def save(self):
-        fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, suffix='.json')
+
+    def _load(self) -> None:
+        try:
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                    self.data.update(json.load(f))
+        except Exception as exc:
+            logger.warning(f'State load error: {exc}')
+
+    def save(self) -> None:
+        fd, temp_path = tempfile.mkstemp(dir=CACHE_DIR, suffix='.json')
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, ensure_ascii=False)
-            shutil.move(tmp, STATE_FILE)
-        except:
+            shutil.move(temp_path, STATE_FILE)
+        except Exception as exc:
+            logger.warning(f'State save error: {exc}')
             try:
-                os.unlink(tmp)
-            except:
+                os.unlink(temp_path)
+            except OSError:
                 pass
-    
-    def is_posted(self, uid):
-        return uid in self.data["posted_ids"]
-    
+
+    def is_posted(self, uid: str) -> bool:
+        return uid in self.data['posted_ids']
+
     def is_duplicate(self, title: str, text: str) -> bool:
-        norm_new = normalize_title(title)
-        for old_title in self.data["recent_titles"][-30:]:
-            if SequenceMatcher(None, norm_new, normalize_title(old_title)).ratio() > 0.65:
+        new_cves = set(re.findall(r'CVE-\d{4}-\d+', text, re.I))
+        for old in self.data['recent_posts'][-20:]:
+            if SequenceMatcher(None, normalize_title(title), normalize_title(old.get('title', ''))).ratio() > 0.65:
                 return True
-        cve_new = set(re.findall(r'CVE-\d{4}-\d+', text, re.I))
-        for old in self.data["recent_posts"][-20:]:
-            cve_old = set(re.findall(r'CVE-\d{4}-\d+', old.get("text",""), re.I))
-            if cve_new & cve_old:
+            old_cves = set(re.findall(r'CVE-\d{4}-\d+', old.get('text', ''), re.I))
+            if new_cves and old_cves and new_cves & old_cves:
                 return True
-        for old in self.data["recent_posts"][-20:]:
-            if calculate_similarity(title, text, old.get("title",""), old.get("text","")) > 0.5:
+            if calculate_similarity(title, text, old.get('title', ''), old.get('text', '')) > 0.58:
                 return True
         return False
-    
+
     def is_too_similar_to_recent(self, title: str, text: str) -> bool:
-        recent = self.data["recent_posts"][-RECENT_POSTS_CHECK:]
-        if len(recent) < 2:
-            return False
-        new_entities = extract_key_entities(title + " " + text)
+        recent = self.data['recent_posts'][-RECENT_POSTS_CHECK:]
         new_topic = detect_topic(title, text)
-        for post in recent:
-            old_title = post.get("title","")
-            old_text = post.get("text","")
-            old_topic = post.get("topic","general")
-            if SequenceMatcher(None, normalize_title(title), normalize_title(old_title)).ratio() > RECENT_SIMILARITY_THRESHOLD:
-                return True
-            if new_topic == old_topic and new_topic != 'general':
-                if len(new_entities & extract_key_entities(old_title + " " + old_text)) >= 2:
-                    return True
+        new_entities = extract_key_entities(f'{title} {text}')
+        for old in recent:
+            old_title = old.get('title', '')
+            old_text = old.get('text', '')
             if calculate_similarity(title, text, old_title, old_text) > RECENT_SIMILARITY_THRESHOLD:
                 return True
+            if new_topic == old.get('topic') and new_topic != 'general':
+                old_entities = extract_key_entities(f'{old_title} {old_text}')
+                if len(new_entities & old_entities) >= 2:
+                    return True
         return False
-    
-    def get_recent_topics_stats(self) -> dict:
-        stats = {}
-        for topic in self.data["recent_topics"][-10:]:
-            stats[topic] = stats.get(topic, 0) + 1
-        return stats
-    
+
     def needs_diversity(self) -> str:
-        if len(self.data["recent_topics"]) < 5:
-            return ""
-        last5 = self.data["recent_topics"][-5:]
-        stats = {}
-        for t in last5:
-            stats[t] = stats.get(t, 0) + 1
-        for topic, cnt in stats.items():
-            if cnt >= 3:
+        topics = self.data['recent_topics'][-5:]
+        if len(topics) < 5:
+            return ''
+        for topic in set(topics):
+            if topics.count(topic) >= 3:
                 return topic
-        return ""
-    
-    def mark_posted(self, uid: str, title: str, text: str = "", topic: str = "general"):
-        if len(self.data["posted_ids"]) > MAX_POSTED_IDS:
-            self.data["posted_ids"] = dict(sorted(self.data["posted_ids"].items(), key=lambda x: x[1])[-400:])
-        self.data["posted_ids"][uid] = int(time.time())
-        self.data["recent_titles"].append(title)
-        if len(self.data["recent_titles"]) > 50:
-            self.data["recent_titles"] = self.data["recent_titles"][-50:]
-        self.data["recent_posts"].append({"title": title, "text": text[:1000], "topic": topic, "time": int(time.time())})
-        if len(self.data["recent_posts"]) > 30:
-            self.data["recent_posts"] = self.data["recent_posts"][-30:]
-        self.data["recent_topics"].append(topic)
-        if len(self.data["recent_topics"]) > 15:
-            self.data["recent_topics"] = self.data["recent_topics"][-15:]
+        return ''
+
+    def mark_posted(self, uid: str, title: str, text: str, topic: str) -> None:
+        if len(self.data['posted_ids']) >= MAX_POSTED_IDS:
+            ordered = sorted(self.data['posted_ids'].items(), key=lambda pair: pair[1])[-400:]
+            self.data['posted_ids'] = dict(ordered)
+        self.data['posted_ids'][uid] = int(time.time())
+        self.data['recent_titles'].append(title)
+        self.data['recent_titles'] = self.data['recent_titles'][-50:]
+        self.data['recent_posts'].append({
+            'title': title,
+            'text': text[:1200],
+            'topic': topic,
+            'time': int(time.time()),
+        })
+        self.data['recent_posts'] = self.data['recent_posts'][-30:]
+        self.data['recent_topics'].append(topic)
+        self.data['recent_topics'] = self.data['recent_topics'][-15:]
         self.save()
+
 
 state = State()
 
-# ============ ВЫЗОВ GROQ (короткий формат) ============
-async def call_groq(prompt: str, max_tokens: int = 700) -> tuple[str, int]:
-    model_key = "main"
-    if not budget.can_use_model(model_key):
-        logger.warning("⚠️ Budget exhausted")
-        return "", 0
-    cfg = MODELS[model_key]
-    try:
-        await budget.wait_for_rate_limit(model_key)
-        response = await asyncio.to_thread(
-            lambda: groq_client.chat.completions.create(
-                model=cfg.name,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                temperature=0.7
-            )
-        )
-        res = response.choices[0].message.content.strip()
-        tokens = response.usage.total_tokens if response.usage else 0
-        budget.add_tokens(cfg.name, tokens)
-        logger.info(f"✅ Model: {model_key} ({tokens} tok)")
-        return res, tokens
-    except Exception as e:
-        logger.warning(f"⚠️ Groq error: {e}")
-        return "", 0
 
-async def call_groq_with_retry(prompt: str, max_tokens: int, retries: int = 2) -> tuple[str, int]:
-    for attempt in range(retries):
-        res, tokens = await call_groq(prompt, max_tokens)
-        if res:
-            return res, tokens
-        wait = 2 ** attempt * 5
-        logger.warning(f"Retry {attempt+1}/{retries} in {wait}s")
-        await asyncio.sleep(wait)
-    return "", 0
-
-# ============ ЗАГРУЗКА ПОЛНОГО ТЕКСТА ============
-async def fetch_full_article(url: str, session: aiohttp.ClientSession) -> str:
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        async with session.get(url, timeout=HTTP_TIMEOUT, headers=headers) as resp:
-            if resp.status != 200:
-                return ""
-            html_text = await resp.text()
-            paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html_text, re.DOTALL | re.IGNORECASE)
-            text = ' '.join(paragraphs)
-            text = re.sub(r'<[^>]+>', ' ', text)
-            text = html.unescape(text)
-            text = re.sub(r'\s+', ' ', text).strip()
-            return text[:4000]
-    except:
-        return ""
-
-# ============ ГЕНЕРАЦИЯ ПОСТА (исправлена: отбрасываем "SKIP") ============
-async def generate_post(item, session: aiohttp.ClientSession) -> Optional[str]:
-    full_text = item.text
-    if len(item.text) < 500:
-        extra = await fetch_full_article(item.link, session)
-        if extra:
-            full_text = item.text + " " + extra
-            logger.info(f"   📄 +{len(extra)} chars")
-
-    prompt = f"""Ты — редактор Telegram-канала о кибербезопасности.
-Сделай краткий анонс (250–500 символов) на русском по новости: суть события, 1–2 ключевых факта, практический вывод.
-Без воды, без рекламы, без призывов подписываться. Ссылку добавлять не нужно — она будет в конце.
-Если новость не про безопасность (уязвимости, атаки, защита, обход блокировок, VPN, DPI, CVE и т.п.) — ответь только словом SKIP.
-
-НОВОСТЬ:
-Заголовок: {item.title}
-Содержание: {full_text[:2000]}
-Источник: {item.source}
-
-Ответ строго в формате JSON: {{"reject": bool, "post_text": string}}.
-Пиши на русском."""
-    
-    max_tokens = 700
-    text, _ = await call_groq_with_retry(prompt, max_tokens, retries=2)
-    
-    if not text:
-        return None
-    
-    # Пробуем распарсить JSON
-    try:
-        data = json.loads(text)
-        if data.get("reject", False):
-            logger.info("⏩ AI: SKIP (reject=true)")
-            return None
-        text = data.get("post_text", "")
-        if not text:
-            logger.info("⏩ AI: empty post_text")
-            return None
-        # ============ НОВАЯ ПРОВЕРКА ============
-        if text.strip().upper() == "SKIP" or text.strip().upper().startswith("SKIP"):
-            logger.info("⏩ AI: post_text is SKIP, rejecting")
-            return None
-    except json.JSONDecodeError:
-        # Если не JSON, используем как есть
-        text_clean = text.strip()
-        if text_clean.upper() == "SKIP" or text_clean.upper().startswith("SKIP"):
-            logger.info("⏩ AI: SKIP (plain text)")
-            return None
-        if len(text) < 50:
-            logger.info(f"⏩ Too short: {len(text)}")
-            return None
-        text = text_clean
-    
-    # Удаляем ссылки из текста (чтобы не дублировать)
-    text = re.sub(r'https?://\S+', '', text)
-    text = re.sub(r'<a\s+[^>]*>.*?</a>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<a\s+[^>]*>', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'</a>', '', text, flags=re.IGNORECASE)
-    
-    # Добавляем ссылку на источник
-    source_suffix = f"\n\n🔗 <a href='{item.link}'>Источник</a>"
-    
-    # Оставляем запас для обрезки
-    max_len = 4096 - len(source_suffix) - 5
-    if len(text) > max_len:
-        text = smart_trim(text, max_len)
-        if len(text) > max_len:
-            for sep in ['. ', '! ', '? ', '.\n', '!\n', '?\n']:
-                pos = text.rfind(sep, 0, max_len)
-                if pos != -1:
-                    text = text[:pos + len(sep)].strip()
-                    break
-            else:
-                pos = text.rfind(' ', 0, max_len)
-                if pos != -1:
-                    text = text[:pos] + '…'
-                else:
-                    text = text[:max_len] + '…'
-    
-    return text + source_suffix
-
-# ============ КЛАССЫ ДАННЫХ ============
 @dataclass
 class NewsItem:
-    type: Literal["news", "video"]
+    type: Literal['news', 'video']
     title: str
     text: str
     link: str
     source: str
     uid: str
 
-# ============ СБОР RSS И YOUTUBE ============
-async def fetch_rss(source: dict, session: aiohttp.ClientSession) -> list:
-    items = []
+
+async def call_groq(prompt: str, max_tokens: int = 1400) -> tuple[str, int]:
+    model_key = 'main'
+    if not budget.can_use_model(model_key):
+        return '', 0
+    cfg = MODELS[model_key]
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; KiberSOSBot/1.0)"}
-        async with session.get(source['url'], timeout=HTTP_TIMEOUT, headers=headers) as resp:
-            if resp.status != 200:
+        await budget.wait_for_rate_limit(model_key)
+        response = await asyncio.to_thread(
+            lambda: groq_client.chat.completions.create(
+                model=cfg.name,
+                messages=[{'role': 'user', 'content': prompt}],
+                max_tokens=max_tokens,
+                temperature=0.45,
+            )
+        )
+        result = (response.choices[0].message.content or '').strip()
+        tokens = response.usage.total_tokens if response.usage else 0
+        budget.add_tokens(cfg.name, tokens)
+        logger.info(f'✅ Groq: {tokens} tokens')
+        return result, tokens
+    except Exception as exc:
+        logger.warning(f'⚠️ Groq error: {exc}')
+        return '', 0
+
+
+async def call_groq_with_retry(prompt: str, max_tokens: int, retries: int = 2) -> tuple[str, int]:
+    for attempt in range(retries):
+        result, tokens = await call_groq(prompt, max_tokens)
+        if result:
+            return result, tokens
+        delay = 5 * (2 ** attempt)
+        logger.warning(f'Groq retry {attempt + 1}/{retries} in {delay}s')
+        await asyncio.sleep(delay)
+    return '', 0
+
+
+async def fetch_full_article(url: str, session: aiohttp.ClientSession) -> str:
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        async with session.get(url, timeout=HTTP_TIMEOUT, headers=headers, allow_redirects=True) as response:
+            if response.status != 200:
+                return ''
+            page = await response.text(errors='ignore')
+        paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', page, re.DOTALL | re.IGNORECASE)
+        text = clean_text(' '.join(paragraphs))
+        return text[:7000]
+    except Exception as exc:
+        logger.debug(f'Article fetch error: {exc}')
+        return ''
+
+
+def has_generic_advice(text: str) -> list[str]:
+    lower = text.lower()
+    return [phrase for phrase in GENERIC_ADVICE_PHRASES if phrase in lower]
+
+
+def remove_links_and_html(text: str) -> str:
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'<[^>]+>', '', text)
+    return re.sub(r'\n{3,}', '\n\n', text).strip()
+
+
+def has_required_post_structure(text: str) -> bool:
+    required = [
+        'что случилось:',
+        'где и кого это касается:',
+        'почему это важно:',
+        'что делать:',
+        'подробнее: в первоисточнике по ссылке ниже.',
+    ]
+    lower = text.lower()
+    if not all(section in lower for section in required):
+        return False
+    steps = re.findall(r'(?m)^\s*[123][.)]\s+\S.+', text)
+    return len(steps) >= 3
+
+
+async def generate_post(item: NewsItem, session: aiohttp.ClientSession) -> Optional[str]:
+    full_text = item.text
+    if len(full_text) < 1800:
+        article_text = await fetch_full_article(item.link, session)
+        if article_text:
+            full_text = clean_text(f'{full_text} {article_text}')
+            logger.info(f'   📄 Full article loaded: {len(article_text)} chars')
+
+    prompt = f'''Ты — редактор Telegram-канала о кибербезопасности, VPN, приватности,
+обходе блокировок, DPI и цифровой безопасности. Создай полноценный Telegram-пост
+на русском языке, используя ТОЛЬКО факты из исходного материала ниже.
+
+КРИТИЧЕСКИ ВАЖНО:
+- Не делай короткий анонс и не пересказывай новость поверхностно.
+- Не выдумывай версии, CVE, даты, страны, технические причины, последствия и инструкции.
+- Сохраняй конкретику из источника: кто, что, где, когда, какие продукты, версии,
+  CVE, цифры, методы атаки, условия, ограничения и официальные действия.
+- Пиши простым разговорным русским, без канцелярита, рекламы, кликбейта и хештегов.
+- Не используй HTML, Markdown, ссылки или слово «Источник» в самом тексте.
+
+Верни ТОЛЬКО валидный JSON. Никаких пояснений, никаких тройных кавычек:
+{{"reject": false, "post_text": "..."}}
+
+Если материал не относится к кибербезопасности, уязвимостям, атакам, утечкам,
+малвари, VPN, прокси, DPI, приватности или блокировкам — верни:
+{{"reject": true, "post_text": ""}}
+
+Структура post_text строго обязательна:
+
+🛡 Короткий точный заголовок по сути новости
+
+Что случилось:
+1–2 абзаца: объясни событие и важный контекст. Не пропускай существенные детали.
+
+Где и кого это касается:
+Укажи названные в источнике компанию, сервис, страну, продукт, версию,
+инфраструктуру и аудиторию. Если данные отсутствуют, напиши: «В источнике это не уточняется».
+
+Почему это важно:
+Покажи практическое значение и последствия именно этой новости.
+
+Что делать:
+1. Первое конкретное действие, которое подтверждается источником.
+2. Второе конкретное действие, которое подтверждается источником.
+3. Третье конкретное действие, которое подтверждается источником.
+
+Если в источнике нет трёх точных действий, не придумывай универсальные советы.
+В таком случае в пунктах можно указать только честные действия: проверить названный
+продукт/версию/индикаторы, свериться с официальным бюллетенем, применить конкретное
+исправление, если это упоминается в материале. Не пиши: «будьте бдительны»,
+«используйте антивирус», «регулярно обновляйтесь», «проверяйте ссылки»,
+«используйте сложные пароли».
+
+Последняя строка post_text должна быть ТОЧНО такой:
+Подробнее: в первоисточнике по ссылке ниже.
+
+Размер post_text: от 700 до 1900 символов без ссылки.
+
+НОВОСТЬ:
+Заголовок: {item.title}
+Площадка: {item.source}
+Материал:
+{full_text[:6000]}
+'''
+
+    raw_text, _ = await call_groq_with_retry(prompt, max_tokens=1400, retries=2)
+    if not raw_text:
+        return None
+
+    try:
+        result = json.loads(raw_text)
+        if result.get('reject') is True:
+            logger.info('⏩ AI rejected article')
+            return None
+        text = str(result.get('post_text', '')).strip()
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        logger.warning(f'⏩ Invalid AI JSON: {exc}')
+        return None
+
+    text = remove_links_and_html(text)
+    if not text or text.upper().startswith('SKIP'):
+        return None
+
+    if len(text) < config.min_post_length:
+        logger.info(f'⏩ Rejected: text too short ({len(text)} chars)')
+        return None
+
+    if not has_required_post_structure(text):
+        logger.info('⏩ Rejected: required structure or three steps are missing')
+        return None
+
+    generic_phrases = has_generic_advice(text)
+    if generic_phrases:
+        logger.info(f'⏩ Rejected: generic advice found: {generic_phrases[:2]}')
+        return None
+
+    source_url = html.escape(item.link, quote=True)
+    suffix = f'\n\n🔗 <a href="{source_url}">Источник: подробности и официальные материалы</a>'
+    max_length = 4096 - len(suffix)
+    if len(text) > max_length:
+        text = text[:max_length].rsplit(' ', 1)[0].rstrip(',.:;') + '…'
+
+    return text + suffix
+
+
+async def fetch_rss(source: dict, session: aiohttp.ClientSession) -> list[NewsItem]:
+    items: list[NewsItem] = []
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (compatible; KiberSOSBot/3.0)'}
+        async with session.get(source['url'], timeout=HTTP_TIMEOUT, headers=headers) as response:
+            if response.status != 200:
+                logger.warning(f"RSS {source['name']}: HTTP {response.status}")
                 return []
-            text = await resp.text()
-        feed = feedparser.parse(text)
-        count = len(feed.entries)
+            xml = await response.text(errors='ignore')
+        feed = feedparser.parse(xml)
         passed = 0
         for entry in feed.entries[:10]:
-            link = entry.get('link')
-            if not link:
+            link = entry.get('link', '')
+            title = clean_text(entry.get('title', ''))
+            if not link or not title:
                 continue
-            uid = hashlib.md5(link.encode()).hexdigest()
+            uid = hashlib.md5(link.encode('utf-8')).hexdigest()
             if state.is_posted(uid):
                 continue
-            title = entry.get('title', '')
-            summary = clean_text(entry.get("summary", "") or entry.get("description", ""))
-            content = ""
-            if hasattr(entry, 'content') and entry.content:
+            summary = clean_text(entry.get('summary', '') or entry.get('description', ''))
+            content = ''
+            if getattr(entry, 'content', None):
                 content = clean_text(entry.content[0].get('value', ''))
-            full_text = summary + " " + content
-            if passes_local_filters(title, full_text):
-                items.append(NewsItem("news", title, full_text, link, source['name'], uid))
+            article_text = clean_text(f'{summary} {content}')
+            if passes_local_filters(title, article_text):
+                items.append(NewsItem('news', title, article_text, link, source['name'], uid))
                 passed += 1
-        logger.info(f"   {source['name']}: {passed}/{count} passed")
-    except Exception as e:
-        logger.warning(f"⚠️ RSS error ({source['name']}): {e}")
+        logger.info(f"   {source['name']}: {passed}/{len(feed.entries)} passed")
+    except Exception as exc:
+        logger.warning(f"RSS error ({source['name']}): {exc}")
     return items
 
-async def fetch_youtube(channel: dict, session: aiohttp.ClientSession) -> list:
-    items = []
+
+async def fetch_youtube(channel: dict, session: aiohttp.ClientSession) -> list[NewsItem]:
+    items: list[NewsItem] = []
     try:
-        url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel['id']}"
-        async with session.get(url, timeout=HTTP_TIMEOUT) as resp:
-            if resp.status != 200:
+        feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel['id']}"
+        async with session.get(feed_url, timeout=HTTP_TIMEOUT) as response:
+            if response.status != 200:
                 return []
-            text = await resp.text()
-        feed = feedparser.parse(text)
+            xml = await response.text(errors='ignore')
+        feed = feedparser.parse(xml)
         for entry in feed.entries[:2]:
-            vid = entry.get('yt_videoid')
-            if not vid:
+            video_id = entry.get('yt_videoid', '')
+            if not video_id:
                 continue
-            uid = f"yt_{vid}"
+            uid = f'yt_{video_id}'
             if state.is_posted(uid):
                 continue
             try:
-                ts = await asyncio.to_thread(
-                    lambda v=vid: YouTubeTranscriptApi.list_transcripts(v)
-                    .find_transcript(['en', 'ru']).fetch()
+                transcript = await asyncio.to_thread(
+                    lambda value=video_id: YouTubeTranscriptApi.list_transcripts(value)
+                    .find_transcript(['en', 'ru'])
+                    .fetch()
                 )
-                full = " ".join([t['text'] for t in ts])
-                if passes_local_filters(entry.title, full):
-                    items.append(NewsItem("video", entry.title, full[:5000], entry.link, f"YT:{channel['name']}", uid))
-            except:
-                pass
-    except:
-        pass
+                transcript_text = ' '.join(item['text'] for item in transcript)
+                title = clean_text(entry.get('title', ''))
+                if passes_local_filters(title, transcript_text):
+                    items.append(NewsItem(
+                        'video',
+                        title,
+                        transcript_text[:7000],
+                        entry.get('link', f'https://www.youtube.com/watch?v={video_id}'),
+                        f"YT:{channel['name']}",
+                        uid,
+                    ))
+            except Exception as exc:
+                logger.debug(f"YouTube transcript skipped ({channel['name']}): {exc}")
+    except Exception as exc:
+        logger.warning(f"YouTube feed error ({channel['name']}): {exc}")
     return items
 
-def clean_text(text: str) -> str:
-    if not text:
-        return ""
-    text = re.sub(r'<[^>]+>', ' ', text)
-    text = html.unescape(text)
-    return re.sub(r'\s+', ' ', text).strip()
 
-# ============ ОСНОВНОЙ ЦИКЛ ============
-async def main():
-    logger.info("🚀 Starting KiberSOS v3.0 (Groq SDK) – короткие анонсы, как FREE CODING")
-    
-    async with aiohttp.ClientSession() as session:
-        logger.info("📡 Fetching sources...")
-        tasks = [fetch_rss(s, session) for s in RSS_SOURCES] + [fetch_youtube(c, session) for c in YOUTUBE_CHANNELS]
-        results = await asyncio.gather(*tasks)
-        all_items = [i for r in results for i in r]
-        logger.info(f"📦 Total after filters: {len(all_items)}")
-        
-        if not all_items:
-            logger.info("No items passed filters")
-            await bot.session.close()
-            return
-        
-        dominant = state.needs_diversity()
-        if dominant:
-            other = [i for i in all_items if detect_topic(i.title, i.text) != dominant]
-            same = [i for i in all_items if detect_topic(i.title, i.text) == dominant]
-            all_items = other + same
-            logger.info(f"⚖️ Reordered: {len(other)} other topics first")
-        else:
-            random.shuffle(all_items)
-        
-        posts_done = 0
-        max_posts = 1
-        attempts = 0
-        max_attempts = 15
-        
-        for item in all_items:
-            if posts_done >= max_posts or attempts >= max_attempts:
-                break
-            if not budget.can_use_model("main"):
-                logger.warning("⚠️ Budget exhausted")
-                break
-            attempts += 1
-            logger.info(f"🔍 [{attempts}/{max_attempts}] {item.source}: {item.title[:50]}...")
-            
-            if state.is_duplicate(item.title, item.text):
-                state.mark_posted(item.uid, item.title, item.text, detect_topic(item.title, item.text))
-                continue
-            if state.is_too_similar_to_recent(item.title, item.text):
-                state.mark_posted(item.uid, item.title, item.text, detect_topic(item.title, item.text))
-                continue
-            
-            post_text = await generate_post(item, session)
-            if not post_text:
-                state.mark_posted(item.uid, item.title, item.text, detect_topic(item.title, item.text))
-                continue
-            
-            try:
-                await bot.send_message(CHANNEL_ID, text=post_text)
-                logger.info("✅ Posted!")
-                state.mark_posted(item.uid, item.title, item.text, detect_topic(item.title, item.text))
-                posts_done += 1
-            except Exception as e:
-                logger.error(f"Telegram error: {e}")
-        
-        stats = state.get_recent_topics_stats()
-        if stats:
-            logger.info(f"📈 Recent topics: {stats}")
-    
-    await bot.session.close()
-
-# ============ ИСТОЧНИКИ ============
 RSS_SOURCES = [
-    {"name": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/"},
-    {"name": "TheHackerNews", "url": "https://feeds.feedburner.com/TheHackersNews"},
-    {"name": "KrebsOnSecurity", "url": "https://krebsonsecurity.com/feed/"},
-    {"name": "DarkReading", "url": "https://www.darkreading.com/rss.xml"},
-    {"name": "SecurityWeek", "url": "https://www.securityweek.com/feed/"},
-    {"name": "ThreatPost", "url": "https://threatpost.com/feed/"},
-    {"name": "NakedSecurity", "url": "https://nakedsecurity.sophos.com/feed/"},
-    {"name": "WeLiveSecurity", "url": "https://www.welivesecurity.com/en/rss/feed/"},
-    {"name": "GrahamCluley", "url": "https://grahamcluley.com/feed/"},
-    {"name": "Schneier", "url": "https://www.schneier.com/feed/"},
-    {"name": "CyberScoop", "url": "https://www.cyberscoop.com/feed/"},
-    {"name": "HackRead", "url": "https://www.hackread.com/feed/"},
-    {"name": "InfoSecurity Magazine", "url": "https://www.infosecurity-magazine.com/rss/news/"},
-    {"name": "ZDNet Security", "url": "https://www.zdnet.com/topic/security/rss.xml"},
-    {"name": "Malwarebytes Labs", "url": "https://blog.malwarebytes.com/feed/"},
-    {"name": "RecordedFuture", "url": "https://www.recordedfuture.com/feed"},
-    {"name": "Kaspersky", "url": "https://www.kaspersky.com/blog/feed/"},
-    {"name": "Cisco Talos", "url": "https://blog.talosintelligence.com/feeds/posts/default"},
-    {"name": "Unit42", "url": "https://unit42.paloaltonetworks.com/feed/"},
-    {"name": "CERT-EU", "url": "https://cert.europa.eu/blog/atom.xml"},
+    {'name': 'BleepingComputer', 'url': 'https://www.bleepingcomputer.com/feed/'},
+    {'name': 'TheHackerNews', 'url': 'https://feeds.feedburner.com/TheHackersNews'},
+    {'name': 'KrebsOnSecurity', 'url': 'https://krebsonsecurity.com/feed/'},
+    {'name': 'DarkReading', 'url': 'https://www.darkreading.com/rss.xml'},
+    {'name': 'SecurityWeek', 'url': 'https://www.securityweek.com/feed/'},
+    {'name': 'ThreatPost', 'url': 'https://threatpost.com/feed/'},
+    {'name': 'NakedSecurity', 'url': 'https://nakedsecurity.sophos.com/feed/'},
+    {'name': 'WeLiveSecurity', 'url': 'https://www.welivesecurity.com/en/rss/feed/'},
+    {'name': 'GrahamCluley', 'url': 'https://grahamcluley.com/feed/'},
+    {'name': 'Schneier', 'url': 'https://www.schneier.com/feed/'},
+    {'name': 'CyberScoop', 'url': 'https://www.cyberscoop.com/feed/'},
+    {'name': 'HackRead', 'url': 'https://www.hackread.com/feed/'},
+    {'name': 'InfoSecurity Magazine', 'url': 'https://www.infosecurity-magazine.com/rss/news/'},
+    {'name': 'ZDNet Security', 'url': 'https://www.zdnet.com/topic/security/rss.xml'},
+    {'name': 'Malwarebytes Labs', 'url': 'https://blog.malwarebytes.com/feed/'},
+    {'name': 'RecordedFuture', 'url': 'https://www.recordedfuture.com/feed'},
+    {'name': 'Kaspersky', 'url': 'https://www.kaspersky.com/blog/feed/'},
+    {'name': 'Cisco Talos', 'url': 'https://blog.talosintelligence.com/feeds/posts/default'},
+    {'name': 'Unit42', 'url': 'https://unit42.paloaltonetworks.com/feed/'},
+    {'name': 'CERT-EU', 'url': 'https://cert.europa.eu/blog/atom.xml'},
 ]
 
 YOUTUBE_CHANNELS = [
-    {"name": "JohnHammond", "id": "UCVeW9qkBjo3zosnqUbG7CFw"},
-    {"name": "NetworkChuck", "id": "UC9x0AN7BWHpXyPic4IQC74Q"},
-    {"name": "LiveOverflow", "id": "UClcE-kVhqyiHCcjYwcpfj9w"},
+    {'name': 'JohnHammond', 'id': 'UCVeW9qkBjo3zosnqUbG7CFw'},
+    {'name': 'NetworkChuck', 'id': 'UC9x0AN7BWHpXyPic4IQC74Q'},
+    {'name': 'LiveOverflow', 'id': 'UClcE-kVhqyiHCcjYwcpfj9w'},
 ]
 
-if __name__ == "__main__":
+
+async def main() -> None:
+    logger.info('🚀 Starting KiberSOS v3.1 — detailed structured posts')
+    try:
+        async with aiohttp.ClientSession() as session:
+            logger.info('📡 Fetching RSS and YouTube sources...')
+            tasks = [fetch_rss(source, session) for source in RSS_SOURCES]
+            tasks += [fetch_youtube(channel, session) for channel in YOUTUBE_CHANNELS]
+            results = await asyncio.gather(*tasks)
+            all_items = [item for group in results for item in group]
+            logger.info(f'📦 Articles after filters: {len(all_items)}')
+
+            if not all_items:
+                return
+
+            dominant_topic = state.needs_diversity()
+            if dominant_topic:
+                different_topics = [item for item in all_items if detect_topic(item.title, item.text) != dominant_topic]
+                same_topic = [item for item in all_items if detect_topic(item.title, item.text) == dominant_topic]
+                random.shuffle(different_topics)
+                random.shuffle(same_topic)
+                all_items = different_topics + same_topic
+                logger.info(f'⚖️ Topic diversity: avoiding {dominant_topic} first')
+            else:
+                random.shuffle(all_items)
+
+            posted = 0
+            attempts = 0
+            for item in all_items:
+                if posted >= config.max_posts_per_run or attempts >= config.max_attempts:
+                    break
+                if not budget.can_use_model('main'):
+                    logger.warning('⚠️ Groq token budget exhausted')
+                    break
+
+                attempts += 1
+                topic = detect_topic(item.title, item.text)
+                logger.info(f'🔍 [{attempts}/{config.max_attempts}] {item.source}: {item.title[:80]}')
+
+                if state.is_duplicate(item.title, item.text):
+                    logger.info('⏩ Duplicate skipped')
+                    state.mark_posted(item.uid, item.title, item.text, topic)
+                    continue
+
+                if state.is_too_similar_to_recent(item.title, item.text):
+                    logger.info('⏩ Too similar to recent posts, skipped')
+                    state.mark_posted(item.uid, item.title, item.text, topic)
+                    continue
+
+                post_text = await generate_post(item, session)
+                if not post_text:
+                    logger.info('⏩ Article not suitable for publication')
+                    state.mark_posted(item.uid, item.title, item.text, topic)
+                    continue
+
+                try:
+                    await bot.send_message(CHANNEL_ID, text=post_text, disable_web_page_preview=True)
+                    logger.info('✅ Post published')
+                    state.mark_posted(item.uid, item.title, item.text, topic)
+                    posted += 1
+                except Exception as exc:
+                    logger.error(f'Telegram send error: {exc}')
+
+            logger.info(f'🏁 Finished. Published: {posted}')
+    finally:
+        await bot.session.close()
+
+
+if __name__ == '__main__':
     asyncio.run(main())
