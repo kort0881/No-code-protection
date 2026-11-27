@@ -599,7 +599,7 @@ YOUTUBE_CHANNELS = [
 
 
 async def main() -> None:
-    logger.info('🚀 Starting KiberSOS v3.1 — detailed structured posts')
+    logger.info('🚀 Starting KiberSOS v3.2 — читаемые посты, отбор по значимости')
     try:
         async with aiohttp.ClientSession() as session:
             logger.info('📡 Fetching RSS and YouTube sources...')
@@ -651,8 +651,9 @@ async def main() -> None:
                     continue
 
                 if DRY_RUN:
+                    # Сухой прогон не расходует материал: в канал ничего не ушло,
+                    # значит и помечать статью опубликованной нельзя.
                     logger.info('🧪 DRY_RUN — пост не отправлен:\n%s', post_text)
-                    state.mark_posted(item.uid, item.title, item.text, topic)
                     posted += 1
                     continue
 
