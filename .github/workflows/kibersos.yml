@@ -5,6 +5,11 @@ on:
   schedule:
     - cron: '0 6,12,15,18 * * *'   # UTC: 06,12,15,18 → MSK+3
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Сгенерировать пост и показать в логе, не отправлять'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -33,6 +38,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           CACHE_DIR: cache_sec
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
         run: python scripts/kibersos_autopost.py
       
       - name: Commit state

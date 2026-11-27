@@ -24,6 +24,8 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from groq import Groq
 
+from post_format import build_prompt, html_escape, rank_candidates, sanitize_post, validate_post
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -51,6 +53,9 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=35)
 MAX_POSTED_IDS = 500
 RECENT_POSTS_CHECK = 10
 RECENT_SIMILARITY_THRESHOLD = 0.50
+RECENT_TITLES_IN_PROMPT = 8
+# DRY_RUN=1 — сгенерировать пост и напечатать его, но не отправлять в канал.
+DRY_RUN = os.getenv('DRY_RUN', '0').strip().lower() not in ('0', '', 'false', 'no')
 
 
 @dataclass
@@ -359,6 +364,7 @@ class NewsItem:
     link: str
     source: str
     uid: str
+    published_ts: Optional[float] = None
 
 
 async def call_groq(prompt: str, max_tokens: int = 1400) -> tuple[str, int]:
@@ -446,100 +452,43 @@ async def generate_post(item: NewsItem, session: aiohttp.ClientSession) -> Optio
             full_text = clean_text(f'{full_text} {article_text}')
             logger.info(f'   📄 Full article loaded: {len(article_text)} chars')
 
-    prompt = f'''Ты — редактор Telegram-канала о кибербезопасности, VPN, приватности,
-обходе блокировок, DPI и цифровой безопасности. Создай полноценный Telegram-пост
-на русском языке, используя ТОЛЬКО факты из исходного материала ниже.
+    recent = state.data.get('recent_titles', [])[-RECENT_TITLES_IN_PROMPT:]
+    prompt = build_prompt(item.title, full_text, item.source, recent)
+    errors: list[str] = []
 
-КРИТИЧЕСКИ ВАЖНО:
-- Не делай короткий анонс и не пересказывай новость поверхностно.
-- Не выдумывай версии, CVE, даты, страны, технические причины, последствия и инструкции.
-- Сохраняй конкретику из источника: кто, что, где, когда, какие продукты, версии,
-  CVE, цифры, методы атаки, условия, ограничения и официальные действия.
-- Пиши простым разговорным русским, без канцелярита, рекламы, кликбейта и хештегов.
-- Не используй HTML, Markdown, ссылки или слово «Источник» в самом тексте.
-
-Верни ТОЛЬКО валидный JSON. Никаких пояснений, никаких тройных кавычек:
-{{"reject": false, "post_text": "..."}}
-
-Если материал не относится к кибербезопасности, уязвимостям, атакам, утечкам,
-малвари, VPN, прокси, DPI, приватности или блокировкам — верни:
-{{"reject": true, "post_text": ""}}
-
-Структура post_text строго обязательна:
-
-🛡 Короткий точный заголовок по сути новости
-
-Что случилось:
-1–2 абзаца: объясни событие и важный контекст. Не пропускай существенные детали.
-
-Где и кого это касается:
-Укажи названные в источнике компанию, сервис, страну, продукт, версию,
-инфраструктуру и аудиторию. Если данные отсутствуют, напиши: «В источнике это не уточняется».
-
-Почему это важно:
-Покажи практическое значение и последствия именно этой новости.
-
-Что делать:
-1. Первое конкретное действие, которое подтверждается источником.
-2. Второе конкретное действие, которое подтверждается источником.
-3. Третье конкретное действие, которое подтверждается источником.
-
-Если в источнике нет трёх точных действий, не придумывай универсальные советы.
-В таком случае в пунктах можно указать только честные действия: проверить названный
-продукт/версию/индикаторы, свериться с официальным бюллетенем, применить конкретное
-исправление, если это упоминается в материале. Не пиши: «будьте бдительны»,
-«используйте антивирус», «регулярно обновляйтесь», «проверяйте ссылки»,
-«используйте сложные пароли».
-
-Последняя строка post_text должна быть ТОЧНО такой:
-Подробнее: в первоисточнике по ссылке ниже.
-
-Размер post_text: от 700 до 1900 символов без ссылки.
-
-НОВОСТЬ:
-Заголовок: {item.title}
-Площадка: {item.source}
-Материал:
-{full_text[:6000]}
-'''
-
-    raw_text, _ = await call_groq_with_retry(prompt, max_tokens=1400, retries=2)
-    if not raw_text:
-        return None
-
-    try:
-        result = json.loads(raw_text)
+    # Две попытки: вторая — с перечнем нарушений, чтобы модель их исправила.
+    for attempt in range(2):
+        if attempt:
+            prompt = (
+                build_prompt(item.title, full_text, item.source, recent)
+                + '\n\nПредыдущий вариант забракован редактором: '
+                + '; '.join(errors[:4])
+                + '.\nПерепиши пост так, чтобы этих нарушений не было.'
+            )
+        raw_text, _ = await call_groq_with_retry(prompt, max_tokens=1600, retries=2)
+        if not raw_text:
+            return None
+        try:
+            result = json.loads(raw_text)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            logger.warning(f'⏩ Invalid AI JSON: {exc}')
+            errors = ['ответ не JSON']
+            continue
         if result.get('reject') is True:
             logger.info('⏩ AI rejected article')
             return None
-        text = str(result.get('post_text', '')).strip()
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
-        logger.warning(f'⏩ Invalid AI JSON: {exc}')
+        text = sanitize_post(str(result.get('post_text', '')))
+        errors = validate_post(text, full_text)
+        if not errors:
+            logger.info(f'✅ Post passed checks ({len(text)} chars)')
+            break
+        logger.info(f'⏩ Post failed checks: {errors[:4]}')
+
+    if errors:
         return None
 
-    text = remove_links_and_html(text)
-    if not text or text.upper().startswith('SKIP'):
-        return None
-
-    if len(text) < config.min_post_length:
-        logger.info(f'⏩ Rejected: text too short ({len(text)} chars)')
-        return None
-
-    if not has_required_post_structure(text):
-        logger.info('⏩ Rejected: required structure or three steps are missing')
-        return None
-
-    generic_phrases = has_generic_advice(text)
-    if generic_phrases:
-        logger.info(f'⏩ Rejected: generic advice found: {generic_phrases[:2]}')
-        return None
-
-    source_url = html.escape(item.link, quote=True)
-    suffix = f'\n\n🔗 <a href="{source_url}">Источник: подробности и официальные материалы</a>'
-    max_length = 4096 - len(suffix)
-    if len(text) > max_length:
-        text = text[:max_length].rsplit(' ', 1)[0].rstrip(',.:;') + '…'
-
+    source_url = html_escape(item.link)
+    suffix = f'\n\n🔗 <a href="{source_url}">Первоисточник</a>'
     return text + suffix
 
 
@@ -567,8 +516,11 @@ async def fetch_rss(source: dict, session: aiohttp.ClientSession) -> list[NewsIt
             if getattr(entry, 'content', None):
                 content = clean_text(entry.content[0].get('value', ''))
             article_text = clean_text(f'{summary} {content}')
+            published_ts = None
+            if getattr(entry, 'published_parsed', None):
+                published_ts = time.mktime(entry.published_parsed) - time.timezone
             if passes_local_filters(title, article_text):
-                items.append(NewsItem('news', title, article_text, link, source['name'], uid))
+                items.append(NewsItem('news', title, article_text, link, source['name'], uid, published_ts))
                 passed += 1
         logger.info(f"   {source['name']}: {passed}/{len(feed.entries)} passed")
     except Exception as exc:
@@ -660,16 +612,14 @@ async def main() -> None:
             if not all_items:
                 return
 
+            # Сначала самые значимые материалы, а не случайный первый.
+            all_items = rank_candidates(all_items)
+            top = all_items[0]
+            logger.info(f'🏆 Top candidate: {top.source}: {top.title[:80]}')
             dominant_topic = state.needs_diversity()
             if dominant_topic:
-                different_topics = [item for item in all_items if detect_topic(item.title, item.text) != dominant_topic]
-                same_topic = [item for item in all_items if detect_topic(item.title, item.text) == dominant_topic]
-                random.shuffle(different_topics)
-                random.shuffle(same_topic)
-                all_items = different_topics + same_topic
-                logger.info(f'⚖️ Topic diversity: avoiding {dominant_topic} first')
-            else:
-                random.shuffle(all_items)
+                all_items.sort(key=lambda item: detect_topic(item.title, item.text) == dominant_topic)
+                logger.info(f'⚖️ Topic diversity: {dominant_topic} — в конец очереди')
 
             posted = 0
             attempts = 0
@@ -700,9 +650,22 @@ async def main() -> None:
                     state.mark_posted(item.uid, item.title, item.text, topic)
                     continue
 
+                if DRY_RUN:
+                    logger.info('🧪 DRY_RUN — пост не отправлен:\n%s', post_text)
+                    state.mark_posted(item.uid, item.title, item.text, topic)
+                    posted += 1
+                    continue
+
                 try:
                     await bot.send_message(CHANNEL_ID, text=post_text, disable_web_page_preview=True)
                     logger.info('✅ Post published')
+                    logger.info('📝 %s', post_text.split('\n', 2)[0][:120])
+                    state.data['last_post'] = {
+                        'title': item.title,
+                        'source': item.source,
+                        'text': post_text[:2000],
+                        'time': int(time.time()),
+                    }
                     state.mark_posted(item.uid, item.title, item.text, topic)
                     posted += 1
                 except Exception as exc:

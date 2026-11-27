@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Кэш поста: картинки старой версии скрипта в git не нужны.
+# state_*.json НЕ игнорируем — состояние постов ездит через репозиторий.
+cache_sec/*.jpg
+cache_sec/*.jpeg
+cache_sec/*.png
